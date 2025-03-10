@@ -1,0 +1,1706 @@
+(* 
+  This file completes our implementation of a lightning node. 
+  It provides the dynamic part of the implementation, i.e. functions that transform party state.
+  This completes the static part (defined in honestPartyType.mlw), which defines the type of the party state and its invariants.
+
+  This file consists of two modules:
+
+  1) In module `HonestPartyInteractionsImplementation`, we define the two main functions from the interface:
+    a) `initialPartyState` -- defines the initial state of the party (very simple)
+    b) `partyProcessMsg` -- defines how a lightning node reacts to messages, including reacting to changes on gamma (the main party of the implementation).
+
+  2) In module `HonestPartyImplementationSpec`, we use those functions to instantiate interface `partyInterface.AbstractPartySpec`.
+  Why3 automatically generates verification conditions (VC's) that checks that our implementation meets the interface's specification.
+  This module does not contain any explicit proofs, as all important facts are proven in the previous modules.
+
+  The most important and most complicated part if this file is the implementation of `partyProcessMsg` function.
+  It is split into many simple sub-functions that focus on processing different types of orders.Here is a list
+  of those functions and their focuses:
+  1) `payOnChain` - processing of the on-chain payment (when requested by the message `TransferOnChain`).
+  2) `openChannel` - initiate opening of the channel before commitment (when requested by `EnvOpenChannel`). 
+  3) `concludeOpeningIfFundingTxOnChain` - used to finalize channel opening (after the funding message has been processed by Gamma).
+  4) `receiveOpenMessageFromParty` - processing of the channel opening by the counterparty before commitment.
+  5) `initiateTransfer` - initiating the on-channel transfer (requested by a message `TransferOnChannel`)
+  6) `openDispute` - initiating channel closing (triggered by the message `openDispute`, by the counterparty's misbehavior).
+  7) `sendClaimAfterTimeout` - used to close the disputes after the timelock. 
+  8) `receivePayOffChainMessageFromPartyWhenGammaCorrect` - standard channel maintenance, such as processing on-channel transfers.
+  9) `reactToDispute` - used to react to a potential dispute that might have appeared on Gamma. 
+
+  All those functions take a rather uniform set of arguments and have similar specifications.
+  Postconditions of all subfunctions have two main parts:
+  (a) `goodTransition` relation holds between initial state and returned state, and
+  (b) `partyInvariant` is preserved by the returned state and update.
+  
+  Most of those functions have an `_inner` variant, which
+  (a) focuses on the important case of the function,
+  (b) takes unpacked arguments (Why3 tends to rename variables introduced in matches), and
+  (c) sometimes have more precise postconditions.
+  Generally, this is the core of the given function, with arguments and preconditions adjusted to facilitate the proof effort.
+
+  The crucial feature that enables modularity in the implementation is the transitivity of the `goodTransition` predicate
+  (specified in module `partyInterface.GoodTransitionTransitiveLemmas`). This enables the `partyProcessMsg` function to call many functions in 
+  sequence and combine their specifications. This transitivity is not accidental - it is a result of carefully tweaking 
+  many small details in the definition of the `goodTransition` relations.
+
+  We organize this module differently than other modules. In this module, we do not separate implementation, specification and proofs. 
+  Instead, all functions are equipped with an explicit specification (i.e. pre- and postconditions) and the proofs are put inside the functions.
+  All functions in this module are strictly design-by-contract, which means that their definitions are opaque and the only way to reason 
+  about them is via their explicit specification. This style is very convenient for this module,
+  because the specification developed in `partyInterface` is very rich and detailed.
+  As mentioned before, use of the design-by-contract pattern requires putting the proofs inside the implemented functions, 
+  which makes the implementation significantly longer. Interestingly, the proofs are usually series of assertions that resemble 
+  the usual debug assertions from regular (i.e. not formally verified) code. This approach is very 
+  convenient in this module, as it is the most technical module, where the proofs focus on implementation details
+  (whereas the proofs in other modules tend to be more abstract). 
+*)
+
+module HonestPartyInteractionsImplementation
+  use basicTypes.BasicTypes
+  
+  use listLibrary.ListLibrary
+  use basicTypes.Compare
+  use list.Append
+  use signaturesFunctionality.SignaturesFunctionality
+  use gamma.Evaluator
+  use gamma.EvaluatorOnChainForPartyProofs
+  use gamma.GammaInvariant
+  use gamma.GammaBasicLemmas
+  use partyInterface.GoodSplitsAndRevocationsRecord
+  use partyInterface.SimplePartyTypes
+  use partyInterface.GoodTransitionChannel
+  use partyInterface.GoodTransitionClosing
+  use partyInterface.GoodTransition
+  use partyInterface.SimplePartyTypes
+  use honestPartyType.HonestPartyType
+  use honestPartyType.HonestPartyLemmasAndProofs
+  
+  predicate noMoneyTransfer (update : updateRecT) =
+    update.moneySentOnChain = 0 /\
+    update.moneySentInChannel = 0
+  
+  predicate noTimeUpdate (update : updateRecT) (system : partySystemView) =
+    update.timeProcessedTo = system.lastWoken
+  
+  predicate goodTimeProcessedTo (update : updateRecT) (system : partySystemView) =
+    system.lastWoken <= update.timeProcessedTo <= system.currentTime
+  
+  predicate goodView (system : partySystemView) =
+    system.lastWoken <= system.currentTime
+  
+  let lemma updateGenerateGoodView (update : updateRecT) (system : partySystemView) =
+  requires { goodTimeProcessedTo update system }
+  ensures { goodView (applyUpdateRec system update) }
+  ()
+  
+  let function isSignableTx (signable : signableT)  =
+    match signable with
+    | SignableTX _ -> true
+    | _ -> false
+    end
+  
+  let lemma signableTXOnlyAboutOurChannelInnerWhenNotSigningTx (p : partyT) (messagesSigned1 messagesSigned2 : list (signableT, signatureT)) (state : stateT) =
+  requires { signableTXOnlyAboutOurChannelInner p messagesSigned1 state }
+  requires { forall msg sig. num_occ (msg, sig) messagesSigned2 > 0 -> ( num_occ (msg, sig) messagesSigned1 > 0 \/ not isSignableTx msg )}
+  ensures { signableTXOnlyAboutOurChannelInner p messagesSigned2 state }
+  ()
+  
+  let predicate validEnvMsg (pState: partyStateT) (msg: partyInputT) =
+    match msg with
+    | FromEnv (TransferOnChannel amount) ->
+      match pState.state with
+      | AfterCommitment dataAboutChannel ->
+        (match (dataAboutChannel.innerState) with
+        | Standby -> true
+        | _ -> false
+        end) &&
+        amount >= 0 &&
+        amount <= dataAboutChannel.balanceOurExt
+      | _ -> false
+      end
+    | FromEnv (TransferOnChain amount _spendOutput) ->
+      amount >= 0 (*validPayOnChainInner pState amount*)
+    | FromEnv (EnvOpenChannel amount totalAmount _) ->
+      amount >= 0 &&
+      amount <= totalAmount &&
+      amount <= pState.balanceOnChain
+    | _ -> true
+    end
+
+  let lemma bestHsSplitTransitionWhenNoChange (x : option halfSignedSplitT) =
+  ensures { bestHsSplitTransition x x }
+    ()
+  
+  let function couldSpendFrom (spendOutput : contractT) (amount : amountT) (p : partyT) =
+    match spendOutput.contractStatus with
+    | PublicKeyAccount totalAmount controler _ ->
+      amount <= totalAmount &&
+      compareParties controler p 
+    | _ -> false
+    end
+  
+  let lemma emptyTransitionIsGood (myState : partyStateT) (system : partySystemView) =
+  ensures { goodTransition (getSimpleParty myState) system (getSimpleParty myState) (emptyUpdate system) }
+    ()
+  
+  let lemma coherentOurSignaturesPreservedWhenSigning (sigs1 sigs2 : signatureFunctionalityT) (l : list (signableT, signatureT)) (p : partyT)
+                                                      (msg : signableT) (sig : signatureT) =
+  requires { coherentOurSignatures sigs1 p l }
+  requires { (sign p msg sigs1) = (sig, sigs2) }
+  ensures {  coherentOurSignatures sigs2 p (Cons (msg, sig) l) }
+    assert { enlarged sigs1 (Cons (msg, sig) Nil) p sigs2 };
+    let lemma helper (m2 : signableT) =
+    ensures { (exists sig2. num_occ (p, m2, sig2) (sigs2.storage) > 0) <-> (exists sig2. num_occ (m2, sig2) (Cons (msg, sig) l) > 0) }
+      assert { ((exists sig2. num_occ (m2, sig2) l > 0) ) <-> ((exists sig2. num_occ (p, m2, sig2) sigs1.storage > 0) ) };
+      assert { (exists sig2. num_occ (p, m2, sig2) (sigs2.storage) > 0) <-> ((exists sig2. num_occ (m2, sig2) l > 0) \/ msg = m2) }; (*split, destruct H in second branch *)
+      assert { ((exists sig2. num_occ (m2, sig2) l > 0) \/ msg = m2) <-> (exists sig2. num_occ (m2, sig2) (Cons (msg, sig) l) > 0) }  
+    in ()
+  
+  (* internal function for processing on chain payments *)
+  let function payOnChainInner
+    (myState : partyStateT) (system : partySystemView)
+    (amount : amountT) (spendOutput : contractT) : (partyStateT, updateRecT) =
+  requires { goodParty myState }
+  requires { agreement system.sigState myState }
+  requires { 0 <= amount <= myState.balanceOnChainExt } (*form goodEnvMsg *)
+  requires { num_occ spendOutput system.gammaState.activeContracts > 0  }
+  requires { couldSpendFrom spendOutput amount myState.partySide }
+  returns { | (newState, update) -> 
+    goodTransition myState.getSimpleParty system newState.getSimpleParty update /\
+    partyInvariant newState update.newSigState /\
+    noTimeUpdate update system /\
+    update.moneySentInChannel = 0 /\
+    update.moneySentOnChain <= amount }
+    let PublicKeyAccount totalAmount _ _ = spendOutput.contractStatus in
+    let nonce = myState.partyNonce in
+    let newArgs = {sender=myState.partySide; amount=amount; destination=OtherParty; totalAmount=totalAmount; fundingId = placeholderId } in
+    let toSign = SignableTX newArgs in
+    let (sig, newSigState) = sign myState.partySide toSign system.sigState in
+    assert { 
+      immediateLossesInMoveOwnCoinsMsgs system.gammaState newSigState myState.partySide =
+      immediateLossesInMoveOwnCoinsMsgs system.gammaState system.sigState myState.partySide +
+        if (isArgsNewAndGood system.gammaState newArgs myState.partySide system.sigState) then
+        immediateTransactionNetLoss myState.partySide newArgs else 0 };
+        
+    let newPendingPay = MoveOwnCoinsOnChain (newArgs, sig, placeholderId, placeholderId) in
+    let newPartyState = { myState with
+      balanceOnChain = myState.balanceOnChain - amount;
+      balanceOnChainExt = myState.balanceOnChainExt - amount;
+      messagesSigned = Cons (toSign, sig) myState.messagesSigned;
+      partyNonce = nonce + 1;
+    } in
+    bestHsSplitTransitionWhenNoChange (myState.getBestVersionOur);
+    assert { match myState.state with
+     | BeforeCommitment x ->
+       fundingCreatedSentIsValid x (newPartyState.partyNonce) myState.partySide newPartyState.messagesSigned /\ (*unfold fundingCreatedSentIsValid; crushHeavy *)
+       onlyCorrectSplitsSignedInitially x (newPartyState.messagesSigned) (*unfold onlyCorrectSplitsSignedInitially; crushHeavy *) /\
+       noRevokesSigned (newPartyState.messagesSigned) (*crushHeavy *)
+     | _ -> true
+     end};
+    assert { signatureFunctionalityTransition (other myState.partySide) (system.sigState) newSigState };
+    let update = { (emptyUpdate system) with
+      newSigState = newSigState;
+      msgsToSend = Cons (newPendingPay) Nil;
+      moneySentOnChain = amount;
+    } in
+    assert { goodParty newPartyState }; (*unfold goodParty, crushHeavy *)
+      assert { coherentOurSignatures newSigState (newPartyState.partySide) (newPartyState.messagesSigned) };
+    assert { agreement newSigState newPartyState };
+    assert { goodTransitionForClosing (getSimpleParty myState) system (getSimpleParty newPartyState) update }; (*unfold goodTransitionForClosing *)
+    assert { goodTransition (getSimpleParty myState) system (getSimpleParty newPartyState) update }; (*unfold goodTransition*)
+    (newPartyState, update)
+  
+  
+  
+  (* processing on chain payments *)
+  let function payOnChain (myState : partyStateT) (system : partySystemView) (msg: partyInputT) : (partyStateT, updateRecT) =
+  requires { goodParty myState }
+  requires { agreement system.sigState myState }
+  requires { validEnvMsg myState msg }
+  returns { | (newState, update) ->
+    goodTransition myState.getSimpleParty system newState.getSimpleParty update /\
+    partyInvariant newState update.newSigState /\
+    noTimeUpdate update system /\
+    update.moneySentInChannel = 0 /\
+    update.moneySentOnChain <= allowedOnChainLoss msg
+  }
+    match msg with
+    | FromEnv (TransferOnChain amount spendOutput) ->
+      assert { allowedOnChainLoss msg = amount };
+      if num_occ_comp compareSimpleChannel spendOutput system.gammaState.activeContracts > 0 &&
+         couldSpendFrom spendOutput amount myState.partySide &&
+         amount <= myState.balanceOnChainExt then (
+        (*assert { validPayOnChainInner myState amount }; *)
+        let res = (payOnChainInner myState system amount spendOutput) in
+        res
+      ) else (
+        (myState, emptyUpdate system) (*destruct_rec assumption about msg *)
+      )
+    | _ ->
+      assert { 0 = allowedOnChainLoss msg};
+      (myState, emptyUpdate system) (*destruct_rec assumption about msg *)
+    end
+  
+  
+  
+  let predicate preservedBalanceOnChain (p1 p2 : partyStateT) =
+   p1.balanceOnChain = p2.balanceOnChain
+  
+  (* internal function used to open channel *)
+  let function openChannelInner
+    (myState : partyStateT) (system : partySystemView)
+    (amount: amountT) (totalAmount: amountT) (sourceId : idT) : (partyStateT, updateRecT)
+  =
+  requires { myState.state = BeforeCommitment ChannelNotOpened }
+  requires { agreement system.sigState myState }
+  requires { amount >= 0 }
+  requires { amount <= myState.balanceOnChain }
+  requires { amount <= totalAmount }
+  requires { goodParty myState }
+  returns { | (newState, update) ->
+    goodTransition myState.getSimpleParty system newState.getSimpleParty update /\
+    partyInvariant newState update.newSigState /\
+    noTimeUpdate update system /\
+    noMoneyTransfer update
+  }
+  let newPartyState = { myState with
+    balanceOnChainExt = myState.balanceOnChainExt - amount;
+    state = BeforeCommitment (OpenChannelSent amount totalAmount sourceId)
+  } in
+  assert { goodParty newPartyState }; (*unfold goodParty; crushHeavy *)
+    (newPartyState, 
+    { (emptyUpdate system) with
+      newSigState = system.sigState;
+      msgsToSendToCounterParty = Cons (OpenChannel amount) Nil;
+     })
+    
+  
+  
+  
+  (* processing open channel *)
+  let function openChannel (myState : partyStateT) (system : partySystemView) (amount: amountT) (totalAmount: amountT) (sourceId : idT) : (partyStateT, updateRecT) =
+  requires { agreement system.sigState myState }
+  requires { goodParty myState }
+  requires { amount <= totalAmount }
+  requires {
+    match myState.state with
+    | BeforeCommitment _ -> true
+    | AfterCommitment _ -> false
+    end
+  }
+  requires { amount >= 0 }
+  requires { amount <= myState.balanceOnChain }
+  returns { | (newState, update) ->
+    goodTransition myState.getSimpleParty system newState.getSimpleParty update /\
+    partyInvariant newState update.newSigState /\
+    noTimeUpdate update system /\
+    noMoneyTransfer update
+  }
+    match myState.state with
+    | BeforeCommitment ChannelNotOpened ->
+      openChannelInner myState system amount totalAmount sourceId
+    | _ -> (myState, emptyUpdate system)  
+    end
+  
+  (* A function that asks a party to initiate a transfer in channel *)
+  let function initiateTransferInner
+    (myState: partyStateT) (dataAboutChannel : channelDataT) (system : partySystemView) (amount: amountT) : (partyStateT, updateRecT)
+  =
+  requires { myState.state = AfterCommitment dataAboutChannel }
+  requires { dataAboutChannel.innerState = Standby }
+  requires { agreement system.sigState myState }
+  requires { amount >= 0 }
+  requires { amount <= myState.getChannelBalanceExt }
+  requires { goodParty myState }
+  returns { | (newState, update) ->
+    goodTransition myState.getSimpleParty system newState.getSimpleParty update /\
+    partyInvariant newState update.newSigState /\
+    noTimeUpdate update system /\
+    update.moneySentOnChain = 0 /\ update.moneySentInChannel = amount
+  }
+      let pub = myState.splitNonce + 1 in
+      let newInnerState = Initiated (pub, amount) in
+      let newData = {dataAboutChannel with
+        innerState = newInnerState;
+        balanceOurExt = dataAboutChannel.balanceOurExt - amount
+      } in
+      assert {goodChannelData newData myState.partySide };
+      let newParty = {myState with state = AfterCommitment newData} in
+      assert { goodParty newParty }; (*unfold goodParty*)
+      (newParty, { (emptyUpdate system) with
+        newSigState = system.sigState;
+        msgsToSendToCounterParty = Cons (Initializer (pub, amount)) Nil;
+        moneySentInChannel = amount;
+      })
+  
+  
+  
+  
+  (* initiate a transfer in channel *)
+  let function initiateTransfer (myState: partyStateT) (system : partySystemView) (amount: amountT) : (partyStateT, updateRecT) =
+  requires { agreement system.sigState myState }
+  requires { goodParty myState }
+  requires { amount >= 0 }
+  returns { | (newState, update) ->
+    goodTransition myState.getSimpleParty system newState.getSimpleParty update /\
+    partyInvariant newState update.newSigState /\
+    noTimeUpdate update system /\
+    update.moneySentOnChain = 0 /\ update.moneySentInChannel <= amount
+  }
+    match myState.state with
+    | BeforeCommitment _ -> (myState, emptyUpdate system)
+    | AfterCommitment dataAboutChannel ->
+      match dataAboutChannel.innerState with
+      | Standby ->
+        if amount <= myState.getChannelBalanceExt then (
+          let res = initiateTransferInner myState dataAboutChannel system amount in
+          res
+        ) else (myState, emptyUpdate system) (*too much to pay required, cannot process *)
+      | _ ->
+        (myState, emptyUpdate system) (*ignore when not standby*)
+      end
+    end
+
+
+  let function prepareHalfSignedSplit (partyUnCond : partyT) (amountCond : amountT)
+                                      (nonce : nonceT) (funding : transferFromPublicKeyAccountT)
+                                      (sigState : signatureFunctionalityT) : (halfSignedSplitT, signatureFunctionalityT) =
+    let msplit = { partyCond = other partyUnCond ; amountCond = amountCond; id = funding; nonce=nonce } in
+    let split = {condOutput=msplit} in
+    let signOverBlanket, sigState = sign (partyUnCond) (SignableSplit split) sigState in 
+    ({split = split; sigUnCond = signOverBlanket}, sigState)
+  
+  let lemma prepareHalfSignedSplitSpec (partyUnCond : partyT) (amountCond : amountT)
+                                      (nonce : nonceT) (funding : transferFromPublicKeyAccountT)
+                                      (sigState : signatureFunctionalityT) =
+  ensures {
+   let res = prepareHalfSignedSplit partyUnCond amountCond nonce funding sigState in
+   enlarged sigState (Cons (SignableSplit (fst res).split, (fst res).sigUnCond) Nil) partyUnCond (snd res) /\
+   signatureFunctionalityTransition (other partyUnCond) sigState (snd res) } (* unfold res, unfold prepareHalfSignedSplit *)
+     ()
+  
+  
+  (* internal function it initiate channel closure / dispute  *)
+  (*used both when ordered to close the channel or when anomaly is detected *)
+  let function openDisputeInner (myState: partyStateT) (dataAboutChannel : channelDataT) (system : partySystemView)
+                                (simpleChannel : contractT) : (partyStateT, updateRecT) =
+  requires { agreement system.sigState myState }
+  requires { myState.state = AfterCommitment dataAboutChannel }
+  requires { goodParty myState }
+  requires { isSome (myState.getSplitsAndRevocationsRecord.makeStrict) } (* we are committed to some channel, so we have channel to openDispute on ! *)
+  requires { extractChannelByIdFromGamma system.gammaState dataAboutChannel.bestVersionOur.split.condOutput.id = Some simpleChannel }
+  requires { isNormalChannel simpleChannel.contractStatus }
+  returns { | (newState, update) ->
+    goodTransition myState.getSimpleParty system newState.getSimpleParty update /\
+    partyInvariant newState update.newSigState /\
+    noTimeUpdate update system /\
+    noMoneyTransfer update /\
+    whenClosingSendsOpenDisputeInner newState.getSimpleParty system.gammaState update /\ (*used in disputeOpen / timeUpdate *)
+    newState.getSimpleParty.closingChannel
+  }
+    let Normal funding = simpleChannel.contractStatus in
+    assert { funding = (dataAboutChannel.getFundingTx) };
+    let our = dataAboutChannel.bestVersionOur in
+    let sigMy, sigState2 = sign myState.partySide (SignableSplit our.split) system.sigState  in
+    let toGamma = OpenDispute (our, sigMy, placeholderId) in
+    let ghost newMessagesSigned = (Cons (SignableSplit our.split, sigMy) Nil) ++ myState.messagesSigned in
+    assert { coherentOurSignatures sigState2 myState.partySide newMessagesSigned };
+    assert { signatureFunctionalityTransition (other myState.partySide) system.sigState sigState2 };
+    assert {forall msg sig. (num_occ (msg, sig) newMessagesSigned > 0) ->
+            (msg = SignableSplit our.split /\ sig = sigMy) \/
+            (num_occ (msg, sig) myState.messagesSigned > 0)};
+    assert { goodChannelData dataAboutChannel myState.partySide };
+    assert {(dataAboutChannel.balanceOur + dataAboutChannel.balanceThey) = splitValue dataAboutChannel.bestVersionOur.split };
+    assert { forall x. getSecondBestVersionThey (ClosingDispute x) = x };
+    let newData = {dataAboutChannel with
+      innerState = ClosingDispute (getSecondBestVersionThey dataAboutChannel.innerState) } in
+    let _ = assert { goodChannelData newData myState.partySide } in
+    let lemma helper (msg : splitT) (sig : signatureT) =
+    requires { messageSignatureIn newMessagesSigned (SignableSplit msg) sig }
+    ensures { signedSplitsSpec newData (myState.revocationSigs) msg}
+      if messageSignatureIn myState.messagesSigned (SignableSplit msg) sig then
+        assert {signedSplitsSpec dataAboutChannel (myState.revocationSigs) msg}
+      else (
+        assert { msg = our.split };
+        assert { signedSplitsSpec newData (myState.revocationSigs) our.split};
+      ) in
+    assert { goodSplit (our.split) /\ funding = our.split.condOutput.id };
+    let newParty = {myState with
+          state = AfterCommitment newData;
+          messagesSigned = newMessagesSigned} in
+    assert { signableTXOnlyAboutOurChannelInner (myState.partySide) (myState.messagesSigned) (AfterCommitment dataAboutChannel) };
+    signableTXOnlyAboutOurChannelInnerWhenNotSigningTx myState.partySide myState.messagesSigned newMessagesSigned (AfterCommitment newData);
+    assert { goodParty newParty }; (*unfold goodParty*)
+    assert { agreement sigState2 newParty by coherentCounterpartySignatures sigState2 newParty };
+    let update = { (emptyUpdate system) with
+      newSigState = sigState2;
+      msgsToSend = Cons toGamma Nil;
+     } in
+    assert {member toGamma (update.msgsToSend) /\ correctDisputeOpen funding (update.newSigState) toGamma };
+    assert { whenClosingSendsOpenDisputeInner (getSimpleParty newParty) (system.gammaState) update };
+    assert { whenDisputeOpenAfterTimeoutAndCorrectSideSendClaimInner (getSimpleParty newParty) (system.gammaState) update };
+    assert { goodTransition (getSimpleParty myState) system (getSimpleParty newParty) update }; (*unfold goodTransition *)
+    (newParty, update)
+    
+  let ghost function noSecondBestForCommitmentSignedSent (innerState : stateCommittedT) =
+  requires { isCommitmentSignedSent innerState }
+  ensures { getSecondBestVersionThey innerState = None }
+    () (*destruct_term innerState *)
+  
+  (*function used to initiate closing in CommitmentSignedSent state *)
+  let function isSignedSendGetClosing
+    (myState: partyStateT) (dataAboutChannel : channelDataT) (system : partySystemView)
+    : (partyStateT, updateRecT) =
+  requires { goodView system }
+  requires { myState.state = AfterCommitment dataAboutChannel }
+  requires { agreement system.sigState myState }
+  requires { goodParty myState }
+  requires { isCommitmentSignedSent dataAboutChannel.innerState }
+  returns { | (newState, update) -> 
+    goodTransition myState.getSimpleParty system newState.getSimpleParty update /\
+    partyInvariant newState update.newSigState /\
+    noMoneyTransfer update /\
+    whenDisputeOpenAfterTimeoutAndCorrectSideSendClaimInner (getSimpleParty newState) (system.gammaState) update /\
+    newState.getSimpleParty.closingChannel /\
+    update.timeProcessedTo = system.currentTime (*goodTimeProcessedTo update system*)
+  }
+    let ret = { (emptyUpdate system) with timeProcessedTo = system.currentTime; } in
+    let closingData = {dataAboutChannel with
+      innerState = CommitmentSignedSentAndClosing } in
+    let closingParty = {myState with state = AfterCommitment closingData } in
+    assert { goodChannelData dataAboutChannel (closingParty.partySide) };
+    assert oldSignedSplit {  signedSplitsSpecForSignedSplits dataAboutChannel myState.revocationSigs myState.messagesSigned };
+    noSecondBestForCommitmentSignedSent dataAboutChannel.innerState;
+    assert { forall msg.
+      signedSplitsSpec dataAboutChannel (myState.revocationSigs) msg ->
+      signedSplitsSpec closingData (myState.revocationSigs) msg };
+    assert { signedSplitsSpecForSignedSplits closingData myState.revocationSigs myState.messagesSigned  }; (*unfold signedSplitsSpecForSignedSplits in "oldSignedSplit"*)
+    assert { goodParty closingParty }; (*unfold goodParty*)
+    assert { goodTransitionForClosing (getSimpleParty myState) system (getSimpleParty closingParty) ret  };
+    assert { goodTransition (getSimpleParty myState) system (getSimpleParty closingParty) ret  };
+    assert { partyInvariant closingParty system.sigState };
+    (closingParty, ret)
+  
+  (*helper function, used to close the dispute and updating state accordingly *)
+  let function sendClaimAfterTimeout
+    (myState: partyStateT) (dataAboutChannel : channelDataT) (system : partySystemView)
+    (ourChannel : contractT) (splitOnGamma : conditionalOutputT) : (partyStateT, updateRecT)
+  =
+  requires { goodView system }
+  requires { myState.state = AfterCommitment dataAboutChannel }
+  requires { agreement system.sigState myState }
+  requires { goodParty myState }
+  requires { extractChannelByIdFromGamma system.gammaState dataAboutChannel.getFundingTx = Some ourChannel }
+  requires { ourChannel.contractStatus = DisputeOpen splitOnGamma }
+  requires { system.currentTime >= ourChannel.lastContractTransitionTime + channelTimelock - deltaNet }
+  returns { | (newState, update) -> 
+    goodTransition myState.getSimpleParty system newState.getSimpleParty update /\
+    partyInvariant newState update.newSigState /\
+    noMoneyTransfer update /\
+    whenDisputeOpenAfterTimeoutAndCorrectSideSendClaimInner (getSimpleParty newState) (system.gammaState) update /\
+    newState.getSimpleParty.closingChannel /\
+    update.timeProcessedTo = system.currentTime (*goodTimeProcessedTo update system*)
+  }
+  let _gState = system.gammaState in
+  if isCommitmentSignedSent dataAboutChannel.innerState then (
+   isSignedSendGetClosing myState dataAboutChannel system
+  ) else (
+   let disputeOpenTime = ourChannel.lastContractTransitionTime in
+   if not compareParties splitOnGamma.partyCond myState.partySide then (
+     (*we are wrong party to send claimAfterTimeout *)
+     (*anyway, we have to move to closing state when we are ordered to do so, even when dispute on chain is already resolved *)
+     let ret = { (emptyUpdate system) with timeProcessedTo = system.currentTime; } in
+     let newInnerState = ClosingTimeoutSent (getSecondBestVersionThey dataAboutChannel.innerState) in
+     let closingData = {dataAboutChannel with
+       innerState = newInnerState } in
+     let closingParty = {myState with state = AfterCommitment closingData } in
+     assert { other splitOnGamma.partyCond = simplePartySide (getSimpleParty closingParty) };
+     assert { goodTransitionForClosing (getSimpleParty myState) system (getSimpleParty closingParty) ret  }; (*unfold goodTransitionForClosing*)
+     assert { goodTransition (getSimpleParty myState) system (getSimpleParty closingParty) ret  };
+     assert { signableTXOnlyAboutOurChannel closingParty };
+     assert { goodParty closingParty }; (*unfold goodParty *)
+     assert { agreement (ret.newSigState) closingParty };
+     (closingParty, ret)
+ ) else (
+    (*send claim after channelTimelock *)
+     let _ = assert { system.currentTime >= disputeOpenTime + channelTimelock - deltaNet } in
+     let newInnerState = ClosingTimeoutSent (getSecondBestVersionThey dataAboutChannel.innerState) in
+     let _ = assert { getSecondBestVersionThey dataAboutChannel.innerState = getSecondBestVersionThey newInnerState } in
+     let _ = assert { moneyLockedForChannelPayment newInnerState = 0 } in
+     let _ = assert { moneyLockedForChannelPayment dataAboutChannel.innerState >= 0 } in
+     let msg = (SignableClosure splitOnGamma) in
+     let (signatureOnClaimAfterTimout, newSigState) = sign myState.partySide msg system.sigState in
+     let newMessagesSigned = Cons (msg, signatureOnClaimAfterTimout) (myState.messagesSigned) in
+     let newData = {dataAboutChannel with
+       innerState = newInnerState
+       } in
+     let newParty = {myState with
+        state = AfterCommitment newData;
+        messagesSigned = newMessagesSigned
+        } in
+     let claimToSend = ClaimAfterTimeout (splitOnGamma, signatureOnClaimAfterTimout, (placeholderId)) in
+     assert { goodChannelData newData (myState.partySide)};
+       assert { signableTXOnlyAboutOurChannelInner (myState.partySide) (myState.messagesSigned) (AfterCommitment dataAboutChannel) };
+       signableTXOnlyAboutOurChannelInnerWhenNotSigningTx myState.partySide myState.messagesSigned newMessagesSigned (AfterCommitment newData); (* finisher *)
+     assert { signableTXOnlyAboutOurChannel newParty }; 
+       assert { forall msg sig.
+                messageSignatureIn (newParty.messagesSigned) (SignableSplit msg) sig ->
+                messageSignatureIn (myState.messagesSigned) (SignableSplit msg) sig };
+     assert { goodParty newParty }; (*unfold goodParty *)
+     let update = { (emptyUpdate system) with
+      msgsToSend = Cons claimToSend Nil;
+      newSigState = newSigState;
+      timeProcessedTo = system.currentTime;
+     } in
+     assert { makeStrict ((getSimpleParty newParty).channelInfo) =
+              Some {recordOwner = myState.partySide; receivedRevocations = myState.revocationSigs; bestSplitReceived = dataAboutChannel.bestVersionOur} };
+     assert { correctClaimAfterTimeout splitOnGamma newSigState claimToSend };
+     assert { revocationSendIfRequired ((getSimpleParty newParty).channelInfo) (system.lastWoken) update (system.gammaState) }; (* unfold revocationSendIfRequired; finisher *)
+     assert { goodTransitionForChannel ((getSimpleParty myState).channelInfo) system ((getSimpleParty newParty).channelInfo) update};
+     assert { whenDisputeOpenAfterTimeoutAndCorrectSideSendClaimInner (getSimpleParty newParty) (system.gammaState) update};
+     assert { goodTransitionForClosing (getSimpleParty myState) system (getSimpleParty newParty) update}; (*unfold goodTransitionForClosing *)
+     assert { goodTransition myState.getSimpleParty system newParty.getSimpleParty update}; (*unfold goodTransition *)
+       assert { coherentCounterpartySignatures newSigState newParty }; 
+     assert { agreement newSigState newParty };
+     (newParty, update)
+   ))
+  
+  
+  let ghost function extractReturnsCorrect (gamma : gammaStateT) (id : transferFromPublicKeyAccountT) (ret : contractT) =
+  requires { extractChannelByIdFromGamma gamma id = Some ret }
+  ensures { hasGivenChannelId id ret }
+  ensures { num_occ ret gamma.activeContracts > 0 }
+   match filter (hasGivenChannelId id) gamma.activeContracts with
+   | Nil -> absurd
+   | Cons x _ ->
+     assert { x = ret };
+     assert { hasGivenChannelId id ret };
+     assert { num_occ ret gamma.activeContracts > 0 };
+   end
+  
+  
+  (* verify : ok *)
+  let function openDispute (myState: partyStateT) (system : partySystemView) : (partyStateT, updateRecT) =
+  requires { goodView system }
+  requires { agreement system.sigState myState }
+  requires { goodParty myState }
+  returns { | (newState, update) ->
+    goodTransition myState.getSimpleParty system newState.getSimpleParty update /\
+    partyInvariant newState update.newSigState /\
+    goodTimeProcessedTo update system /\
+    noMoneyTransfer update /\
+    newState.getSimpleParty.closingChannel
+  }
+    match myState.state with
+    | BeforeCommitment _ ->
+      let newParty = {myState with
+        balanceOnChainExt = (myState.balanceOnChain); (*release lock on money locked for channel funding *)
+        state = (BeforeCommitment ChannelOpenFailed)
+      } in
+      assert { goodParty newParty }; (*unfold goodParty, crushHeavy *)
+      (newParty, emptyUpdate system)
+    | AfterCommitment dataAboutChannel ->
+      match myState.getSplitsAndRevocationsRecord.makeStrict with
+      | None ->
+        assert { isCommitmentSignedSent dataAboutChannel.innerState };
+        isSignedSendGetClosing myState dataAboutChannel system
+      | Some _ ->
+        let closingData = {dataAboutChannel with
+          innerState = ClosingDispute (getSecondBestVersionThey dataAboutChannel.innerState) } in
+        let closingParty = {myState with state = AfterCommitment closingData } in
+        assert { goodChannelData dataAboutChannel (closingParty.partySide) };
+        assert oldSignedSplit { signedSplitsSpecForSignedSplits dataAboutChannel myState.revocationSigs myState.messagesSigned  };
+        assert { forall msg.
+          signedSplitsSpec dataAboutChannel (myState.revocationSigs) msg ->
+          signedSplitsSpec closingData (myState.revocationSigs) msg };
+        assert { signedSplitsSpecForSignedSplits closingData myState.revocationSigs myState.messagesSigned  }; (*unfold signedSplitsSpecForSignedSplits in "oldSignedSplit"*)
+        assert { goodParty closingParty }; (*unfold goodParty, crushHeavy *)
+        assert { partyInvariant closingParty system.sigState };
+        match extractChannelByIdFromGamma system.gammaState dataAboutChannel.getFundingTx with
+        | Some simpleChannel ->
+          match simpleChannel.contractStatus with
+          | Normal _funding ->
+            let res = openDisputeInner myState dataAboutChannel system simpleChannel in
+            res
+          | DisputeOpen msplit ->
+            if system.currentTime >= simpleChannel.lastContractTransitionTime + channelTimelock - deltaNet then
+              sendClaimAfterTimeout myState dataAboutChannel system simpleChannel msplit
+            else (
+              let ret = (emptyUpdate system) in
+              assert { goodTransitionForClosing (getSimpleParty myState) system (getSimpleParty closingParty) ret  }; (*unfold goodTransitionForClosing *)
+              assert { goodTransition (getSimpleParty myState) system (getSimpleParty closingParty) ret  }; (* unfold goodTransition *)
+              (closingParty, ret)
+            )
+          | PublicKeyAccount _ _ _ ->
+            assert { hasGivenChannelId dataAboutChannel.getFundingTx simpleChannel};
+            assert { extractChannelId simpleChannel.contractStatus = None };
+            absurd
+          end
+        | None ->
+          let ret = (emptyUpdate system) in
+          assert { goodTransitionForClosing (getSimpleParty myState) system (getSimpleParty closingParty) ret  }; (*unfold goodTransitionForClosing *)
+          assert { goodTransition (getSimpleParty myState) system (getSimpleParty closingParty) ret  }; (* unfold goodTransition *)
+          (closingParty, ret)
+        end
+      end
+    end
+  
+  
+  
+  let function getFirstFundeeSplit (party: partyT) (nonce: nonceT) (channelId : transferFromPublicKeyAccountT) : conditionalOutputT =
+    {
+      partyCond = party;
+      amountCond = 0;
+      id = channelId;
+      nonce = nonce
+    }
+  
+  let function getFirstFunderSplit (party: partyT) (amount: amountT) (nonce: nonceT) (channelId : transferFromPublicKeyAccountT) : conditionalOutputT =
+    {
+      partyCond = party;
+      amountCond = amount;
+      id = channelId;
+      nonce = nonce
+    }
+  
+  let ghost function extractIsSpent (gamma : gammaStateT) (id : transferFromPublicKeyAccountT) =
+  requires { gammaCoherent gamma }
+  requires { not member id.fundingId (usedIds gamma) }
+  ensures { extractChannelByIdFromGamma gamma id = None }
+  ensures { not member (expectedContractStatusMoveOwnCoins id) (gamma.allContracts) }
+    assert { (expectedContractStatusMoveOwnCoins id).extractAccountId = Some id.fundingId };
+    assert { not member (expectedContractStatusMoveOwnCoins id).extractAccountId (map extractAccountId gamma.allContracts) };  
+    assert { not member (expectedContractStatusMoveOwnCoins id) (gamma.allContracts) };
+    match filter (hasGivenChannelId id) gamma.activeContracts with
+    | Nil ->
+      assert { extractChannelByIdFromGamma gamma id = None };
+    | Cons elem _tl ->
+      assert { hasGivenChannelId id elem };
+      assert { num_occ elem gamma.activeContracts > 0 };
+      assert { num_occ elem.contractStatus gamma.allContracts > 0 }; 
+      assert { elem.contractStatus.extractChannelId = Some id };
+      assert { elem.contractStatus.extractChannelId = Some id };
+      assert { isSpent_comp (expectedContractStatusMoveOwnCoins id) gamma };
+      absurd
+    end
+  
+  let function receiveOpenMessageFromPartyInner
+    (myState: partyStateT) (stateOpening : stateOpeningT) (system : partySystemView)
+    (msgProcessed: msgToPartyT) : (partyStateT, updateRecT)
+  =
+  requires { myState.state = BeforeCommitment stateOpening }
+  requires { agreement system.sigState myState }
+  requires { goodParty myState }
+  requires { gammaCoherent system.gammaState }
+  returns { | (newState, update) ->
+    goodTransition myState.getSimpleParty system newState.getSimpleParty update /\
+    partyInvariant newState update.newSigState /\
+    noTimeUpdate update system /\
+    noMoneyTransfer update
+  }
+    let sigState = system.sigState in
+    let _gState = system.gammaState in
+    let _time = system.currentTime in
+    let failState = { myState with
+        state = BeforeCommitment ChannelOpenFailed;
+        balanceOnChainExt = myState.balanceOnChain (*refunding money locked in channel opening *)
+    } in
+    assert { goodParty failState }; (*unfold goodParty; crushHeavy *)
+    assert { agreement sigState failState };
+    let failUpdateRec =
+      (failState, emptyUpdate system) in
+    assert { (* unfolding goodParty *)
+      hasPositiveAmount stateOpening /\
+      fundingCreatedSentIsValid stateOpening myState.partyNonce myState.partySide myState.messagesSigned /\
+      onlyCorrectSplitsSignedInitially stateOpening myState.messagesSigned /\
+      true
+    };
+    match stateOpening, msgProcessed with
+    | ChannelNotOpened, OpenChannel amount -> (* fundee *)
+      if amount < 0 then failUpdateRec else
+      let newParty = { myState with
+        state = BeforeCommitment (AcceptChannelSent amount)
+      } in
+      let update = { (emptyUpdate system) with
+        msgsToSendToCounterParty = Cons (AcceptChannel amount) Nil;
+      } in
+      assert { goodParty newParty }; (*unfold goodParty *)
+      (newParty, update)
+    | OpenChannelSent ourAmount inputAmountFull inputId, AcceptChannel theirAmount -> (* funder *)
+      if ourAmount <> theirAmount then failUpdateRec else
+      let fundingTx = {
+        sender = myState.partySide;
+        amount = ourAmount;
+        destination = Channel;
+        totalAmount = inputAmountFull; (* refinement will subst this value *)
+        fundingId = inputId; (* refinement will subst this value *)
+      } in
+      let msplit = getFirstFundeeSplit (other myState.partySide) myState.partyNonce fundingTx in
+      let _ = assert { msplit.partyCond = other myState.partySide } in
+      let split = {condOutput = msplit } in
+      let sig, newSigState = sign myState.partySide (SignableSplit split) sigState in
+      let fundeesSignedSplit = {
+        split = split;
+        sigUnCond = sig
+      } in
+      let newStateOpening = FundingCreatedSent fundingTx fundeesSignedSplit in
+      let newMessagesSigned = (Cons (SignableSplit split, sig) Nil) ++ myState.messagesSigned in
+      let _ = assert { forall msg sig. not messageSignatureIn myState.messagesSigned (SignableSplit msg) sig } in
+      let _ = assert { onlyCorrectSplitsSignedInitially newStateOpening newMessagesSigned } in (*unfold onlyCorrectSplitsSignedInitially *)
+      let newParty = { myState with
+          state = BeforeCommitment newStateOpening;
+          messagesSigned = newMessagesSigned;
+          partyNonce = myState.partyNonce + 1;
+        } in
+      assert { fundingCreatedSentIsValid newStateOpening (newParty.partyNonce) (newParty.partySide) newParty.messagesSigned };
+        assert { forall args, sig. args.sender = newParty.partySide -> num_occ (SignableTX args, sig) (newParty.messagesSigned) > 0 -> args.destination = Channel ->
+          getId (myState.state) = Some args  }; 
+      assert { signableTXOnlyAboutOurChannel newParty };
+      assert { goodParty newParty }; (*unfold goodParty *)
+      let update = { (emptyUpdate system) with
+        newSigState = newSigState;
+        msgsToSendToCounterParty = Cons (FundingCreated fundingTx fundeesSignedSplit) Nil;
+      } in
+      immediateLossesInMoveOwnCoinsMsgsWhenSigningNotTx sigState newSigState myState.partySide (SignableSplit split) system.gammaState;
+      assert { agreement newSigState newParty by coherentCounterpartySignatures newSigState newParty };
+      assert { goodTransitionForChain (getSimpleParty myState) system (getSimpleParty newParty) update };
+      assert { goodTransition (getSimpleParty myState) system (getSimpleParty newParty) update }; (*unfold goodTransition *)
+      (newParty, update)
+    (* fundeesHSS signed by funder, fundersHSS signed by fundee *)
+    | AcceptChannelSent theirAmount, FundingCreated fundingTx fundeesHalfSignedSplit -> (* fundee *)
+      if not compareParties fundingTx.sender (other myState.partySide) then failUpdateRec else
+      if not fundingTx.amount = theirAmount then failUpdateRec else
+      if not compareDestinations fundingTx.destination Channel then failUpdateRec else
+      if not compareConditionalOutputs fundeesHalfSignedSplit.split.condOutput (getFirstFundeeSplit myState.partySide myState.splitNonce fundingTx) then failUpdateRec else
+      if not verify_comp (other myState.partySide) (SignableSplit fundeesHalfSignedSplit.split) fundeesHalfSignedSplit.sigUnCond sigState then failUpdateRec else
+      if not fundeesHalfSignedSplit.split.condOutput.id.totalAmount >= 0 then failUpdateRec else (* incorrect transition *)
+      let msplitv = getFirstFunderSplit (other myState.partySide) theirAmount myState.splitNonce fundingTx in
+      let splitv = {condOutput = msplitv} in
+      let sig, newSigState = sign myState.partySide (SignableSplit splitv) sigState in
+      let fundersHalfSignedSplit = {
+        split = splitv;
+        sigUnCond = sig
+      } in
+      let newChannelData = {
+            innerState = CommitmentSignedSent;
+            balanceOur = 0; (* redundant but informative *)
+            balanceOurExt = 0;
+            balanceThey = fundingTx.amount;
+            bestVersionOur = fundeesHalfSignedSplit;
+            bestVersionThey = fundersHalfSignedSplit;
+          } in
+      let newPartyState = { myState with
+          state = AfterCommitment newChannelData;
+          messagesSigned = (Cons (SignableSplit splitv, sig) Nil) ++ myState.messagesSigned;
+        } in
+      assert { forall msg sig. messageSignatureIn newPartyState.messagesSigned (SignableSplit msg) sig ->
+        signedSplitsSpec newChannelData (newPartyState.revocationSigs) msg };
+      assert { goodChannelData newChannelData (newPartyState.partySide) };
+      assert { signableTXOnlyAboutOurChannel newPartyState }; (* crushHeavy; finisher *)
+      assert { goodParty newPartyState }; (*unfold goodParty*)
+      assert { agreement newSigState newPartyState by coherentCounterpartySignatures newSigState newPartyState };
+        assert { forall s sig. num_occ (SignableSplit s, sig) (myState.messagesSigned) = 0 };
+        assert { coherentOurSignatures sigState myState.partySide myState.messagesSigned };
+      assert { forall s sig. (not verify myState.partySide (SignableSplit s) sig sigState ) };
+      let update = { (emptyUpdate system) with
+        newSigState = newSigState;
+        msgsToSendToCounterParty = Cons (CommitmentSigned fundersHalfSignedSplit) Nil;
+      } in
+      assert { onlyLegalTransfers (getSplitsAndRevocationsRecord myState) (getSplitsAndRevocationsRecord newPartyState) (system.gammaState) newSigState};
+      assert { goodTransitionForChannel myState.getSplitsAndRevocationsRecord system newPartyState.getSplitsAndRevocationsRecord update };
+      assert { goodTransitionForChain (getSimpleParty myState) system (getSimpleParty newPartyState) update };
+      assert { goodTransition (getSimpleParty myState) system (getSimpleParty newPartyState) update };
+      (newPartyState, update)
+    
+    | FundingCreatedSent fundingTx2 fundeesHalfSignedSplit, CommitmentSigned fundersHalfSignedSplit -> (* funder *)
+      if not compareConditionalOutputs fundersHalfSignedSplit.split.condOutput (getFirstFunderSplit myState.partySide fundingTx2.amount myState.splitNonce fundingTx2) then failUpdateRec else
+      if not verify_comp (other myState.partySide) (SignableSplit fundersHalfSignedSplit.split) fundersHalfSignedSplit.sigUnCond sigState then failUpdateRec else
+      if not fundersHalfSignedSplit.split.condOutput.id.totalAmount >= 0 then failUpdateRec else (* incorrect transition *)
+      if  not (isNone (extractChannelByIdFromGamma (system.gammaState) (fundersHalfSignedSplit.split.condOutput.id))) then failUpdateRec else
+      if not member_comp compareContractStatus (expectedContractStatusMoveOwnCoins (fundersHalfSignedSplit.getTracedChannelIdInner)) (contractStatuses (system.gammaState)) then failUpdateRec else
+      let _ = assert { fundingTx2.sender = myState.partySide /\ fundingTx2.destination=Channel } in
+      let signableFundingTx = SignableTX fundingTx2 in
+      let sig, newSigState = sign myState.partySide signableFundingTx sigState in
+      let newChannelData = {
+            innerState = WaitingForFundingTxInclusion;
+            balanceOur = fundingTx2.amount;
+            balanceThey = 0;
+            balanceOurExt = fundingTx2.amount;
+            bestVersionOur = fundersHalfSignedSplit;
+            bestVersionThey = fundeesHalfSignedSplit;
+          }
+      in
+      let lemma helper (sig : signatureT) =
+        requires { messageSignatureIn (Cons (signableFundingTx, sig) myState.messagesSigned) (SignableSplit fundeesHalfSignedSplit.split) sig }
+        ensures {
+          signedSplitsSpec newChannelData (myState.revocationSigs) fundeesHalfSignedSplit.split
+        }
+        assert { messageSignatureIn (myState.messagesSigned) (SignableSplit fundeesHalfSignedSplit.split) sig }
+      in
+      let newPartyState = { myState with
+          state = AfterCommitment newChannelData;
+          balanceOnChain = myState.balanceOnChain - fundingTx2.amount;
+          partyNonce = myState.partyNonce + 1;
+          messagesSigned = (Cons (signableFundingTx, sig) myState.messagesSigned) ;
+        } in
+      
+      assert { onlyCorrectSplitsSignedInitially stateOpening (myState.messagesSigned) }; (* directly from goodParty *)
+      assert { forall msg sig. messageSignatureIn newPartyState.messagesSigned (SignableSplit msg) sig -> (* unfolding of above *)
+        (msg =  fundeesHalfSignedSplit.split /\ sig = fundeesHalfSignedSplit.sigUnCond) }; (*cvc after split*)
+      assert { forall msg sig. messageSignatureIn newPartyState.messagesSigned (SignableSplit msg) sig ->
+        signedSplitsSpec newChannelData (newPartyState.revocationSigs) msg };
+      assert { goodChannelData newChannelData (newPartyState.partySide) };
+      
+      let recordRec = {
+        recordOwner = myState.partySide;
+        bestSplitReceived = fundersHalfSignedSplit;
+        receivedRevocations = myState.revocationSigs;
+        } in
+      assert { makeStrict (getSplitsAndRevocationsRecord newPartyState) = Some recordRec };
+      assert { fundingTx2 = getFundingTx newChannelData };
+      assert { isFunder (getFundingTx newChannelData) (myState.partySide) };
+        assert { verify (myState.partySide) signableFundingTx sig newSigState };
+      assert { isSigned (myState.partySide) (SignableTX (getFundingTx newChannelData)) newSigState};
+        assert { goodFunding (system.gammaState) (getFundingTx newChannelData) };
+        assert { signableTXOnlyAboutOurChannel myState };
+      assert { signableTXOnlyAboutOurChannel newPartyState }; (* unfold signableTXOnlyAboutOurChannel *)
+      assert { goodParty newPartyState }; (*unfold goodParty*)
+        assert { coherentOurSignatures newSigState (newPartyState.partySide) (newPartyState.messagesSigned)};
+        assert { coherentCounterpartySignatures newSigState newPartyState }; (*finisher*)
+      assert { agreement newSigState newPartyState };
+      let msg = (MoveOwnCoinsOnChain (fundingTx2, sig, placeholderId, placeholderId)) in
+      let toSend2 = Cons msg Nil in
+      let update = { (emptyUpdate system) with
+        newSigState = newSigState;
+        msgsToSend = toSend2;
+        moneyMovedToChannel = fundingTx2.amount
+      } in
+        assert { isRecordsVirtualChannelInNormal (getSplitsAndRevocationsRecord newPartyState) (system.gammaState) newSigState }; (*unfold isRecordsVirtualChannelInNormal *)
+      assert { onlyLegalTransfers (myState.getSplitsAndRevocationsRecord)
+        (newPartyState.getSplitsAndRevocationsRecord) (system.gammaState) newSigState };
+      assert { immediateTransactionNetLoss (myState.partySide) fundingTx2 <= update.moneyMovedToChannel };
+      immediateLossesInMoveOwnCoinsMsgsWhenSigningTx sigState newSigState myState.partySide fundingTx2 system.gammaState;
+      assert { goodTransitionForChain (getSimpleParty myState) system (getSimpleParty newPartyState) update };
+        assert { member (expectedContractStatusMoveOwnCoins (newChannelData.bestVersionOur.getTracedChannelIdInner)) (contractStatuses (system.gammaState)) };
+        assert { inputPresentOnGamma (system.gammaState) (newChannelData.bestVersionOur.getTracedChannelIdInner) }; (*unfold inputPresentOnGamma*)
+        assert { correctChannelOpening (newChannelData.bestVersionOur.getTracedChannelIdInner) (update.newSigState) (system.gammaState) msg };
+        assert { whenComingToChannelChannelOpenerSentOrChannelPresentOnGamma (getSimpleParty myState) system (getSimpleParty newPartyState) update };
+      assert { goodTransition (getSimpleParty myState) system (getSimpleParty newPartyState) update }; (*unfold goodTransition *)
+      (newPartyState, update)
+    | ChannelNotOpened, _
+    | OpenChannelSent _ _ _, _
+    | AcceptChannelSent _, _
+    | ChannelOpenFailed, _
+    | FundingCreatedSent _ _, _ -> failUpdateRec
+    end
+
+  (*verify : ok *)
+  let function receiveOpenMessageFromParty (myState: partyStateT) (system : partySystemView) (innerMsg: msgToPartyT) : (partyStateT, updateRecT) =
+  requires { agreement system.sigState myState }
+  requires { goodParty myState }
+  requires { gammaCoherent system.gammaState }
+  requires {
+    match myState.state with
+    | AfterCommitment _ -> false
+    | BeforeCommitment _ -> true
+    end
+  }
+  returns { | (newState, update) ->
+    goodTransition myState.getSimpleParty system newState.getSimpleParty update /\
+    partyInvariant newState update.newSigState /\
+    noTimeUpdate update system /\
+    noMoneyTransfer update
+  }
+    match myState.state with
+    | AfterCommitment _ -> absurd
+    | BeforeCommitment stateOpening ->
+      let res = receiveOpenMessageFromPartyInner myState stateOpening system innerMsg in
+      res
+    end
+   
+  (*verify : ok *)
+  let lemma signedConditionalSplits (myState : partyStateT) (dataAboutChannel : channelDataT) (msgSplit : splitT) (sig : signatureT) =
+  requires { myState.state = AfterCommitment dataAboutChannel}
+  requires goodPartyReq { goodParty myState }
+  requires { msgSplit.condOutput.partyCond = myState.partySide }
+  requires { num_occ (SignableSplit msgSplit, sig) myState.messagesSigned > 0 }
+  ensures { msgSplit = dataAboutChannel.bestVersionOur.split /\ isClosing dataAboutChannel.innerState }
+    let msgMini = msgSplit.condOutput in
+    assert eval { signedSplitsSpec dataAboutChannel (myState.revocationSigs) msgSplit }; (*crushHeavy *)
+    match findSplitRevocation msgMini (myState.revocationSigs) with
+    | None ->
+      assert { msgSplit = dataAboutChannel.bestVersionOur.split /\ isClosing dataAboutChannel.innerState  }; (*unfold goodParty in goodPartyReq*)
+    | Some sigRev ->
+      assert { num_occ (sigRev, msgMini) (myState.revocationSigs) > 0 };
+      absurd (*unfold goodParty in goodPartyReq  *)
+    end
+
+  let ghost function whenNormalNotDisoputeOpen (gamma : gammaStateT) (channelId : transferFromPublicKeyAccountT) =
+  requires { isOurChannelInNormal gamma channelId }
+  ensures { None = isOurChannelInDisputeOpen gamma channelId }
+    match extractChannelByIdFromGamma gamma channelId with
+    | None -> assert { None = isOurChannelInDisputeOpen gamma channelId}
+    | Some simpleChannel ->
+        match simpleChannel.contractStatus with
+        | DisputeOpen _msplitResolved ->
+          absurd
+        | _ -> assert { None = isOurChannelInDisputeOpen gamma channelId }
+        end
+    end
+  
+  (*gState only used during finalazition of channelOpening *)
+  let function receivePayOffChainMessageFromPartyWhenGammaCorrect
+    (myState: partyStateT) (dataAboutChannel : channelDataT) (system : partySystemView)
+    (msgProcessed: msgToPartyT) : option (partyStateT, updateRecT)
+  =
+  requires { myState.state = AfterCommitment dataAboutChannel}
+  requires { isOurChannelInNormal system.gammaState dataAboutChannel.getFundingTx }
+  requires { agreement system.sigState myState }
+  requires { goodParty myState }
+  returns { | Some (newState, update) ->
+    goodTransition myState.getSimpleParty system newState.getSimpleParty update /\
+    partyInvariant newState update.newSigState /\
+    noTimeUpdate update system /\
+    update.moneySentOnChain = 0 /\
+    update.moneySentInChannel <= allowedOnChannelLoss (FromParty msgProcessed)
+            | None -> true }
+    let gState = system.gammaState in
+    let sigState = system.sigState in
+    match dataAboutChannel.innerState, msgProcessed with
+    | Standby, Initializer (pubHis, amount) ->
+        if amount < 0 then None else
+        if amount > dataAboutChannel.balanceThey then None else
+        let our = dataAboutChannel.bestVersionOur in
+        let pubMy = our.split.condOutput.nonce + 1 in
+        let (blanket, sigState2) =
+          prepareHalfSignedSplit myState.partySide (dataAboutChannel.balanceThey-amount)
+                                 pubHis dataAboutChannel.getFundingTx sigState in
+        prepareHalfSignedSplitSpec myState.partySide (dataAboutChannel.balanceThey-amount)
+          pubHis dataAboutChannel.getFundingTx sigState;
+        immediateLossesInMoveOwnCoinsMsgsWhenSigningNotTx sigState sigState2 myState.partySide (SignableSplit blanket.split) system.gammaState;
+        assert { coherentOurSignatures sigState2 myState.partySide ((Cons (SignableSplit blanket.split, blanket.sigUnCond) Nil) ++ myState.messagesSigned) };
+        assert { signatureFunctionalityTransition (other myState.partySide) sigState sigState2 };
+        let newMessagesSigned = (Cons (SignableSplit blanket.split, blanket.sigUnCond) Nil) ++ myState.messagesSigned in
+        let newData = {dataAboutChannel with
+          innerState = InProgress (pubMy, amount, blanket);
+        } in
+        let lemma proveSignedSplitsSpec (msg : splitT) (sig : int) =
+        requires { messageSignatureIn newMessagesSigned (SignableSplit msg) sig }
+        ensures { signedSplitsSpec newData (myState.revocationSigs) msg }
+          let st =signedSplitsSpec newData (myState.revocationSigs) msg in
+          if compareSplits msg blanket.split then
+            assert { st} (*unfold signedSplitsSpec; crushHeavy *)
+          else (
+            assert { messageSignatureIn myState.messagesSigned (SignableSplit msg) sig };
+            assert { st} (*unfold signedSplitsSpec; crushHeavy *)
+          ) in
+          assert { (newData.balanceOur - newData.balanceOurExt) = moneyLockedForChannelPayment (newData.innerState) }; (* finisher *)
+        assert { goodChannelData newData (myState.partySide) }; (*unfold goodChannelData *)
+        let newParty = { myState with
+            messagesSigned = newMessagesSigned;
+            state = AfterCommitment newData;
+          } in
+        assert { agreement sigState2 (newParty) }; (*unfold agreement *)
+          signableTXOnlyAboutOurChannelInnerWhenNotSigningTx myState.partySide myState.messagesSigned newMessagesSigned myState.state;
+        assert { signableTXOnlyAboutOurChannel newParty }; 
+        assert { goodParty newParty }; (*unfold goodParty *)
+        let update = { (emptyUpdate system) with
+          msgsToSendToCounterParty = Cons (Commit (pubMy, blanket)) Nil;
+          newSigState = sigState2;
+        } in
+        assert { goodTransitionForChannel (getSimpleParty myState).channelInfo system (getSimpleParty newParty).channelInfo update };
+        assert { goodTransitionForChain (getSimpleParty myState) system (getSimpleParty newParty) update };
+        Some (newParty, update)
+    | Initiated (_innerKeyMy, amount), (Commit (pubHis, blanketIncoming)) ->
+        (* check incoming msg *)
+        if not compareParties blanketIncoming.split.condOutput.partyCond (myState.partySide) then None else
+        if not blanketIncoming.split.amountUnCond = dataAboutChannel.balanceThey+amount then None else (* this is before correction of balance *)
+        if not blanketIncoming.split.condOutput.amountCond = dataAboutChannel.balanceOur-amount then None else
+        if not blanketIncoming.split.condOutput.nonce = (*myState.bestVersionOur.split.nonce*) myState.splitNonce + 1 then None else
+        if not compareArgs (blanketIncoming.split.condOutput.id) (dataAboutChannel.bestVersionOur.split.condOutput.id) then None else
+        if not verify_comp (other myState.partySide) (SignableSplit blanketIncoming.split) blanketIncoming.sigUnCond sigState then None else (
+        assert { verify (other myState.partySide) (SignableSplit blanketIncoming.split) blanketIncoming.sigUnCond sigState };
+        (* generate our message *)
+        let blanketThey, sigState2 = (prepareHalfSignedSplit myState.partySide  (dataAboutChannel.balanceThey + amount) pubHis dataAboutChannel.getFundingTx sigState) in
+        immediateLossesInMoveOwnCoinsMsgsWhenSigningNotTx sigState sigState2 myState.partySide (SignableSplit blanketThey.split) system.gammaState;
+        assert { verify (other myState.partySide) (SignableSplit blanketIncoming.split) blanketIncoming.sigUnCond sigState2 };
+        assert { coherentOurSignatures sigState2 myState.partySide ((Cons (SignableSplit blanketThey.split, blanketThey.sigUnCond) Nil) ++ myState.messagesSigned) };
+        (*unfold coherentOurSignatures*)
+        (* generate revocation *)
+        let sigInnerKey, sigState3 =
+          sign myState.partySide (SignableRevoke dataAboutChannel.bestVersionOur.split.condOutput) sigState2 in
+        assert { included sigState sigState3 by included sigState sigState2};
+        assert { blanketThey.split.condOutput.partyCond = other (myState.partySide)};
+        let messagesSignedListPartial = Cons (SignableSplit blanketThey.split, blanketThey.sigUnCond) myState.messagesSigned in
+        assert { forall split sig. num_occ (SignableRevoke split, sig) messagesSignedListPartial > 0 -> split.nonce < myState.splitNonce };
+        let our = dataAboutChannel.bestVersionOur in
+        assert { our.split.condOutput.nonce = myState.splitNonce };
+        let messagesSignedList = Cons (SignableRevoke our.split.condOutput, sigInnerKey) messagesSignedListPartial in
+        assert { forall split sig. num_occ (SignableRevoke split, sig) messagesSignedList > 0 -> split.nonce < myState.splitNonce + 1};
+        assert { amount >= 0 };
+        assert {forall msg sig. msg.condOutput.partyCond = myState.partySide -> num_occ (SignableSplit msg, sig) myState.messagesSigned > 0 ->
+          (msg = dataAboutChannel.bestVersionOur.split /\ isClosing dataAboutChannel.innerState) };
+        let lemma helper (msg : signableT) =
+        ensures { (exists sig. num_occ (myState.partySide, msg, sig) sigState3.storage > 0 ) <-> 
+                  (exists sig. num_occ (msg, sig) messagesSignedList > 0) }
+          assert { (exists sig. num_occ (myState.partySide, msg, sig) sigState2.storage > 0 ) <->
+                   (exists sig. num_occ (msg, sig) messagesSignedListPartial > 0) };
+          assert { forall x. num_occ x messagesSignedList > 0 -> x = (SignableRevoke our.split.condOutput, sigInnerKey) \/ (member x messagesSignedListPartial)};
+          assert {(exists sig. num_occ (msg, sig) messagesSignedListPartial > 0) -> (exists sig. num_occ (myState.partySide, msg, sig) sigState3.storage > 0 )};
+          assert { (exists sig. num_occ (myState.partySide, msg, sig) sigState3.storage > 0 ) -> (exists sig. num_occ (msg, sig) messagesSignedList > 0) };
+          assert {(exists sig. num_occ (msg, sig) messagesSignedList > 0) -> (exists sig. num_occ (myState.partySide, msg, sig) sigState3.storage > 0 )};
+       
+        in
+        assert { coherentOurSignatures sigState3 myState.partySide messagesSignedList };
+        assert { forall msg sig. messageSignatureIn messagesSignedList (SignableSplit msg) sig -> (
+          (messageSignatureIn myState.messagesSigned (SignableSplit msg) sig &&
+           signedSplitsSpec dataAboutChannel (myState.revocationSigs) msg) \/
+          msg = blanketThey.split) };
+        assert { forall split sig. split.condOutput.partyCond = myState.partySide -> num_occ (SignableSplit split, sig) myState.messagesSigned = 0 };
+        assert { forall split sig. split.condOutput.partyCond = myState.partySide -> num_occ (SignableSplit split, sig) messagesSignedList = 0 };
+        assert { forall msplit sig. num_occ (SignableRevoke msplit, sig) messagesSignedList > 0 -> msplit.nonce < myState.splitNonce + 1};
+        let newData = {dataAboutChannel with
+                         innerState = DoneNotFinal (blanketThey, amount);
+                         bestVersionOur = blanketIncoming;
+                         balanceOur = dataAboutChannel.balanceOur - amount;
+                         balanceThey = dataAboutChannel.balanceThey + amount;
+                       } in
+          assert { dataAboutChannel.balanceOur - dataAboutChannel.balanceOurExt = moneyLockedForChannelPayment dataAboutChannel.innerState };
+        assert { goodChannelData newData myState.partySide }; (*unfold goodChannelData*)
+        let newParty =  { myState with
+                       state = AfterCommitment newData;
+                       messagesSigned = messagesSignedList;
+                       splitNonce = myState.splitNonce + 1;
+                       } in
+        assert { coherentCounterpartySignatures sigState3 newParty }; (*unfold coherentCounterpartySignatures*)
+            signableTXOnlyAboutOurChannelInnerWhenNotSigningTx myState.partySide myState.messagesSigned messagesSignedList myState.state;
+          assert { signableTXOnlyAboutOurChannel newParty };
+            assert { signedSplitsSpec newData (newParty.revocationSigs) blanketThey.split };
+          assert { forall msg sig. messageSignatureIn messagesSignedList (SignableSplit msg) sig -> signedSplitsSpec newData (newParty.revocationSigs) msg };
+        assert {goodParty newParty }; (*unfold goodParty *)
+          assert { preserved (other (myState.partySide)) sigState sigState3 (*unfold preserved, split, crush*) by
+            (preserved (other (myState.partySide)) sigState sigState2 /\
+             preserved (other (myState.partySide)) sigState2 sigState3) };
+        assert {signatureFunctionalityTransition (other (myState.partySide)) sigState sigState3};
+        assert { bestHsSplitTransition (myState.getSplitsAndRevocationsRecord.bestSplitReceivedG) (newParty.getSplitsAndRevocationsRecord.bestSplitReceivedG)};
+        let update = { (emptyUpdate system) with
+          msgsToSendToCounterParty = Cons (CommitAndRevokeAndAck (blanketThey, sigInnerKey)) Nil;
+          newSigState = sigState3
+        } in
+          assert { isRecordsChannelInNormal (system.gammaState) (getSimpleParty myState).channelInfo }; (*unfold isRecordsChannelInNormal *)
+        assert { goodTransitionForChannel (getSimpleParty myState).channelInfo system (getSimpleParty newParty).channelInfo update };
+        assert { goodTransitionForChain (getSimpleParty myState) system (getSimpleParty newParty) update }; (*unfold goodTransitionForChain *)
+        assert { goodTransitionForClosing (getSimpleParty myState) system (getSimpleParty newParty) update }; (*unfold goodTransitionForClosing *)
+        assert { goodTransition (getSimpleParty myState) system (getSimpleParty newParty) update };
+        Some (newParty, update)
+        )
+    | InProgress (_innerKeyMy, amount, msgSecondThey),  (CommitAndRevokeAndAck (blanket, revocationGet)) ->
+        if not compareParties blanket.split.condOutput.partyCond myState.partySide then None else
+        if not blanket.split.amountUnCond = dataAboutChannel.balanceThey - amount then None else (* this is before correction of balance *)
+        if not blanket.split.condOutput.amountCond = dataAboutChannel.balanceOur + amount then None else
+        if not blanket.split.condOutput.nonce = (*myState.bestVersionOur.split.nonce*) myState.splitNonce + 1 then None else
+        if not compareArgs (blanket.split.condOutput.id) (dataAboutChannel.bestVersionOur.split.condOutput.id) then None else
+        if not verify_comp (other myState.partySide) (SignableSplit blanket.split) blanket.sigUnCond sigState then None else
+
+        let they = dataAboutChannel.bestVersionThey in
+        (* check incoming revokation *)
+        if not verify_comp (other myState.partySide) (SignableRevoke they.split.condOutput) revocationGet sigState then None else
+
+        let our = dataAboutChannel.bestVersionOur in
+        (*generate revocation *)
+        let generatedRevocation, sigState2 = sign myState.partySide (SignableRevoke our.split.condOutput) sigState  in
+        assert { Some msgSecondThey.split = getSecondBestVersionThey dataAboutChannel.innerState };
+        let newRevocationSigs = Cons (revocationGet, they.split.condOutput) myState.revocationSigs in
+        let newMessagesSigned = Cons (SignableRevoke our.split.condOutput, generatedRevocation) Nil ++ myState.messagesSigned in
+        let lemma helper45 (msg : splitT) (sig : signatureT) =
+        requires { messageSignatureIn newMessagesSigned (SignableSplit msg) sig }
+        ensures {
+          msg = our.split \/ msg = they.split \/
+          msg = msgSecondThey.split \/ 
+          isSome (findSplitRevocation msg.condOutput newRevocationSigs) }
+          assert { messageSignatureIn myState.messagesSigned (SignableSplit msg) sig };
+          assert { signedSplitsSpec dataAboutChannel myState.revocationSigs msg } 
+        in
+        let newData = {
+                innerState = Standby;
+                balanceOur = dataAboutChannel.balanceOur + amount;
+                balanceOurExt = dataAboutChannel.balanceOurExt + amount;
+                balanceThey = dataAboutChannel.balanceThey - amount;
+                bestVersionOur = blanket;
+                bestVersionThey = msgSecondThey;
+              } in
+        assert { forall msg sig.
+          messageSignatureIn newMessagesSigned (SignableSplit msg) sig ->
+          signedSplitsSpec newData newRevocationSigs msg }; (*unfold signedSplitsSpec; crushHeavy *)
+          assert { amountSane dataAboutChannel.innerState dataAboutChannel.balanceOur dataAboutChannel.balanceThey };
+        assert { goodChannelData newData myState.partySide }; (*unfold goodChannelData; crushHeavy *)
+        let newParty = { myState with
+              state = AfterCommitment newData;
+              revocationSigs = newRevocationSigs;
+              messagesSigned = newMessagesSigned;
+              splitNonce = myState.splitNonce+1;
+            } in
+            signableTXOnlyAboutOurChannelInnerWhenNotSigningTx myState.partySide myState.messagesSigned newMessagesSigned myState.state;
+          assert { signableTXOnlyAboutOurChannel newParty };
+        assert {goodParty newParty }; (*unfold goodParty *)
+        assert { bestHsSplitTransition (myState.getSplitsAndRevocationsRecord.bestSplitReceivedG) (newParty.getSplitsAndRevocationsRecord.bestSplitReceivedG)};
+        let update = { (emptyUpdate system) with
+          msgsToSendToCounterParty = Cons (RevokeAndAck generatedRevocation) Nil;
+          newSigState = sigState2;
+          moneyReceivedInChannel = amount;
+        } in (
+          whenNormalNotDisoputeOpen gState newData.bestVersionOur.getTracedChannelIdInner;
+          assert { not isRecordsChannelInDisputeOpen (system.gammaState) ((getSimpleParty newParty).channelInfo) };
+        assert { goodTransitionForChannel (getSimpleParty myState).channelInfo system (getSimpleParty newParty).channelInfo update }; (*unfold goodTransitionForChannel *)
+        assert { goodTransitionForChain (getSimpleParty myState) system (getSimpleParty newParty) update }; (*unfold goodTransitionForChain *)
+          assert { amountNotNegative dataAboutChannel.innerState };
+        assert { goodTransitionBasic update };
+        assert { goodTransitionForClosing (getSimpleParty myState) system (getSimpleParty newParty) update }; (*finisher *)
+        assert { goodTransition (getSimpleParty myState) system (getSimpleParty newParty) update }; (*unfold goodTransition *)
+        assert { agreement sigState2 newParty by
+          (included sigState sigState2 && coherentCounterpartySignatures sigState newParty && coherentCounterpartySignatures sigState2 newParty &&
+          coherentOurSignatures sigState2 (newParty.partySide) (newParty.messagesSigned)) };
+        Some (newParty, update)
+        )
+        
+    | DoneNotFinal (blanketThey, _amount),  (RevokeAndAck revocationGet) ->
+        let they = dataAboutChannel.bestVersionThey in
+        (*check incoming revokation *)
+        if not verify_comp (other myState.partySide) (SignableRevoke they.split.condOutput) revocationGet sigState then None else
+        (assert { Some blanketThey.split = getSecondBestVersionThey dataAboutChannel.innerState };
+        let newDataAboutChannel = {dataAboutChannel with
+              innerState = Standby;
+              bestVersionThey = blanketThey;
+            } in
+        let newParty = { myState with
+            state = AfterCommitment newDataAboutChannel;
+            revocationSigs = Cons (revocationGet, they.split.condOutput) myState.revocationSigs;
+          } in
+        assert { goodChannelData newDataAboutChannel myState.partySide }; (*unfold goodChannelData*)
+        assert { forall msg sig. messageSignatureIn (myState.messagesSigned) (SignableSplit msg) sig -> (
+          signedSplitsSpec dataAboutChannel (myState.revocationSigs) msg &&
+          signedSplitsSpec newDataAboutChannel (newParty.revocationSigs) msg)};
+        assert { forall msg sig. messageSignatureIn (newParty.messagesSigned) (SignableSplit msg) sig ->
+          signedSplitsSpec newDataAboutChannel (newParty.revocationSigs) msg};
+          assert { myState.state.getId =  newParty.state.getId };
+        assert { signableTXOnlyAboutOurChannel newParty }; (*unfold signableTXOnlyAboutOurChannel *)
+        assert { goodParty newParty };
+        let update = emptyUpdate system in
+        assert { goodTransitionForChannel (getSimpleParty myState).channelInfo system (getSimpleParty newParty).channelInfo update }; (*unfold goodTransitionForChannel *)
+        assert { goodTransitionForClosing (getSimpleParty myState) system (getSimpleParty newParty) update };
+        assert { goodTransition (getSimpleParty myState) system (getSimpleParty newParty) update }; (*unfold goodTransition *)
+        assert { agreement sigState newParty};
+        Some (newParty, update)
+        )
+    | CommitmentSignedSent, ChannelReadyByFunder -> (* fundee *)
+      match (extractChannelByIdFromGamma gState dataAboutChannel.getFundingTx) with
+      | None ->
+        let update = emptyUpdate system in
+        Some (myState, update)
+      | Some extractedChannel ->
+        if not isNormalChannel extractedChannel.contractStatus then (
+          let update = emptyUpdate system in
+          Some (myState, update)
+        ) else (
+        let _fundingTxExtracted = dataAboutChannel.getFundingTx in
+        let newData = {dataAboutChannel with innerState =  Standby} in
+        assert { goodChannelData newData (myState.partySide) };
+        let newParty = { myState with
+            state = AfterCommitment newData;
+          } in
+        assert { forall msg sig. messageSignatureIn (newParty.messagesSigned) (SignableSplit msg) sig -> signedSplitsSpec newData (newParty.revocationSigs) msg }; (*crushHeavy*)
+        assert { goodParty newParty }; (*unfold goodParty *)
+        let update = { (emptyUpdate system) with
+            msgsToSendToCounterParty = Cons ChannelReadyByFundee Nil;
+          } in
+          assert { (getSimpleParty newParty).channelInfo = newParty.getSplitsAndRevocationsRecord };
+          assert { ((getSimpleParty newParty).channelInfo.makeStrict <&> getTracedChannelId) = Some newData.getFundingTx };
+          assert { newData.getFundingTx = dataAboutChannel.getFundingTx };
+        assert { dataAboutChannel.getFundingTx.destination = Channel };
+        assert { isRecordsVirtualChannelInNormal (getSimpleParty newParty).channelInfo (system.gammaState) (update.newSigState) };
+        assert { goodTransitionForChannel (getSimpleParty myState).channelInfo system (getSimpleParty newParty).channelInfo update };
+        assert { agreement sigState newParty by coherentCounterpartySignatures sigState newParty };
+        assert { goodTransition (getSimpleParty myState) system (getSimpleParty newParty) update }; (*unfold goodTransition*)
+          Some (newParty, update)
+        )
+      end
+    | ChannelReadySentByFunder, ChannelReadyByFundee -> (* funder *)
+      let _tx = dataAboutChannel.getFundingTx in
+      let newParty = { myState with
+            state = AfterCommitment {dataAboutChannel with innerState =  Standby};
+          } in
+      assert { goodParty newParty}; (* finisher *)
+      assert { agreement sigState newParty };
+      let update = emptyUpdate system in
+        Some (newParty, update)
+      
+    | CommitmentSignedSent, _
+    | WaitingForFundingTxInclusion, _ (* It's hard to close the channel in this case, and it's safe to ignore the counterparty's weird message *)
+    | ChannelReadySentByFunder, _ ->
+      let update = emptyUpdate system in
+        Some (myState, update)
+    | _ -> None
+    end
+  
+  
+  
+  let function receivePayOffChainMessageFromParty (myState: partyStateT) (system : partySystemView) (innerMsg: msgToPartyT) : (partyStateT, updateRecT) =
+  requires {
+    match myState.state with
+    | AfterCommitment _ -> true
+    | _ -> false
+    end
+  }
+  requires { agreement system.sigState myState }
+  requires { goodParty myState }
+  returns { | (newState, update) ->
+    goodTransition myState.getSimpleParty system newState.getSimpleParty update /\
+    partyInvariant newState update.newSigState /\
+    noTimeUpdate update system /\
+    noMoneyTransfer update
+  }
+    match myState.state with
+    | BeforeCommitment _ -> absurd
+    | AfterCommitment dataAboutChannel ->
+      if not isOurChannelInNormal system.gammaState dataAboutChannel.getFundingTx then
+        (myState, emptyUpdate system) else
+      match receivePayOffChainMessageFromPartyWhenGammaCorrect myState dataAboutChannel system innerMsg with
+      | Some res ->
+        res
+      | None -> (myState, emptyUpdate system)
+      end
+    end
+  
+  (*verify : ok *)
+  let function reactToDisputeInner
+    (myState: partyStateT) (dataAboutChannel : channelDataT) (system : partySystemView)
+    : (partyStateT, updateRecT)
+  =
+  requires { myState.state = AfterCommitment dataAboutChannel }
+  requires { agreement system.sigState myState }
+  requires { goodParty myState }
+  requires { goodView system }
+  returns { | (newState, update) -> 
+    goodTransition myState.getSimpleParty system newState.getSimpleParty update /\
+    update.timeProcessedTo = system.currentTime /\
+    partyInvariant newState update.newSigState /\
+    noMoneyTransfer update }
+  let gState = system.gammaState in
+  match extractChannelByIdFromGamma gState dataAboutChannel.getFundingTx with
+  | Some simpleChannel ->
+    match simpleChannel.contractStatus with
+    | DisputeOpen msplit ->
+       if isCommitmentSignedSent dataAboutChannel.innerState then (
+         let ret = { (emptyUpdate system) with timeProcessedTo = system.currentTime; } in
+         assert { goodTransitionForClosing (getSimpleParty myState) system (getSimpleParty myState) ret  };
+         assert { goodTransition (getSimpleParty myState) system (getSimpleParty myState) ret  };
+         (myState, ret)
+       ) else (
+       let disputeOpenTime = simpleChannel.lastContractTransitionTime in
+       (* got my money after channelTimelock *)
+       if system.currentTime >= disputeOpenTime + channelTimelock then
+         sendClaimAfterTimeout myState dataAboutChannel system simpleChannel msplit
+       else (
+       (* apply revocation *)
+         match findSplitRevocation msplit myState.revocationSigs with
+         | None ->
+            let _our = dataAboutChannel.bestVersionOur in
+            let _they = dataAboutChannel.bestVersionThey in
+            let newData = {dataAboutChannel with innerState = ClosingWaitingForTimeout (getSecondBestVersionThey dataAboutChannel.innerState)} in
+            let newParty = {myState with
+              state = AfterCommitment newData
+            } in
+            assert { makeStrict ((getSimpleParty newParty).channelInfo) =
+                  Some {recordOwner = myState.partySide; receivedRevocations = myState.revocationSigs; bestSplitReceived = dataAboutChannel.bestVersionOur} };
+            assert { goodChannelData newData (newParty.partySide) };
+              assert { signableTXOnlyAboutOurChannel newParty by signableTXOnlyAboutOurChannel myState };
+            assert { goodParty newParty }; (*unfold goodParty; crush; finisher *)
+            let ret = { (emptyUpdate system) with
+              timeProcessedTo = system.currentTime; } in
+            assert { goodTransitionForChannel ((getSimpleParty myState).channelInfo) system ((getSimpleParty newParty).channelInfo) ret }; (*unfold goodTransitionForChannel *)
+            assert { goodTransitionForClosing (getSimpleParty myState) system (getSimpleParty newParty) ret };
+            assert { agreement system.sigState newParty };
+            (newParty, ret)
+         | Some revocationSig ->
+             let (signatureOfSenderOnRevoke, newSigState) = sign myState.partySide (SignableClosure msplit) system.sigState in
+             let newMessagesSigned = Cons (SignableClosure msplit, signatureOfSenderOnRevoke) myState.messagesSigned in
+             assert { verify myState.partySide (SignableClosure msplit) signatureOfSenderOnRevoke newSigState };
+             let _ = assert { num_occ (revocationSig, msplit) myState.revocationSigs > 0 } in
+             let toGamma = Revoke (msplit, revocationSig, signatureOfSenderOnRevoke, (placeholderId)) in
+             let newData = {dataAboutChannel with
+               innerState = ClosingRevoke (getSecondBestVersionThey dataAboutChannel.innerState);
+             } in
+             let newParty = {myState with
+               state = AfterCommitment newData;
+               messagesSigned = newMessagesSigned;
+             } in
+             assert { coherentOurSignatures newSigState (newParty.partySide) (newParty.messagesSigned) }; (*crushHeavy*)
+             assert { coherentCounterpartySignatures system.sigState newParty }; (*finisher*)
+             assert { agreement newSigState newParty };
+             assert { goodChannelData dataAboutChannel (myState.partySide)};
+             assert { goodChannelData newData myState.partySide };
+             assert { forall msg sig. messageSignatureIn (myState.messagesSigned) (SignableSplit msg) sig -> (
+               signedSplitsSpec dataAboutChannel (myState.revocationSigs) msg &&
+               signedSplitsSpec newData (newParty.revocationSigs) msg)
+            };
+            assert { signableTXOnlyAboutOurChannel newParty by signableTXOnlyAboutOurChannel myState};
+                assert { forall msg sig. messageSignatureIn (myState.messagesSigned) (SignableSplit msg) sig -> signedSplitsSpec newData (newParty.revocationSigs) msg };
+              assert { forall msg sig.
+                    messageSignatureIn (newParty.messagesSigned) (SignableSplit msg) sig ->
+                not messageSignatureIn (myState.messagesSigned) (SignableSplit msg) sig ->
+                  signedSplitsSpec newData (newParty.revocationSigs) msg };
+            assert { goodParty newParty }; (* unfold goodParty *)
+            assert { isOurChannelInDisputeOpen system.gammaState dataAboutChannel.getFundingTx = Some (disputeOpenTime, msplit) };
+            let ret = { (emptyUpdate system) with
+              newSigState = newSigState;
+              msgsToSend = Cons toGamma Nil;
+              timeProcessedTo = system.currentTime;} in
+            assert { makeStrict ((getSimpleParty newParty).channelInfo) =
+                  Some {recordOwner = myState.partySide; receivedRevocations = myState.revocationSigs; bestSplitReceived = dataAboutChannel.bestVersionOur} };
+            assert { msplit.partyCond = other myState.partySide };
+            assert { verify msplit.partyCond (SignableRevoke msplit) revocationSig system.sigState };
+            assert { verify msplit.partyCond (SignableRevoke msplit) revocationSig newSigState };
+            assert { applicableRevokeMsg (ret.newSigState) msplit toGamma /\ num_occ toGamma (ret.msgsToSend) > 0 };
+            assert { revocationSendIfRequired (getSplitsAndRevocationsRecord newParty) (system.lastWoken) ret (system.gammaState) }; (* unfold revocationSendIfRequired *)
+            assert { goodTransitionForChannel (myState.getSplitsAndRevocationsRecord) system (newParty.getSplitsAndRevocationsRecord) ret }; (*unfold goodTransitionForChannel *)
+              assert {ret.timeProcessedTo = system.currentTime };
+            assert { goodTransitionForChain (getSimpleParty myState) system (getSimpleParty newParty) ret}; (*unfold goodTransitionForChain *)
+            assert { goodTransitionForClosing (getSimpleParty myState) system (getSimpleParty newParty) ret }; (*unfold goodTransitionForClosing *)
+            assert { goodTransition (getSimpleParty myState) system (getSimpleParty newParty) ret };
+            (newParty, ret)
+         end
+       ) )
+    | Normal _funding ->
+      if isSome (makeStrict (getSplitsAndRevocationsRecord myState)) && isClosingState myState.state then (
+        let (newState, update) = openDisputeInner myState dataAboutChannel system simpleChannel in
+        let newUpdate = { update with timeProcessedTo = system.currentTime } in
+        match newState.state with
+        | BeforeCommitment _ -> absurd
+        | AfterCommitment newDataAboutChannel ->
+          assert { newDataAboutChannel.getFundingTx = dataAboutChannel.getFundingTx };
+          assert { whenClosingSendsOpenDisputeInner (getSimpleParty newState) (system.gammaState) update };
+          assert { whenClosingSendsOpenDisputeInner (getSimpleParty newState) (system.gammaState) newUpdate }; (*finisher *)
+          assert { goodTransitionForClosing (getSimpleParty myState) system (getSimpleParty newState) newUpdate  }; (*unfold goodTransitionForClosing *)
+          assert { goodTransition (getSimpleParty myState) system (getSimpleParty newState) newUpdate  }; (*unfold goodTransition, al-ergo without split*)
+         (newState, newUpdate)
+       end
+      ) else (
+        let ret = { (emptyUpdate system) with
+          timeProcessedTo = system.currentTime; } in
+        assert { goodTransitionForClosing (getSimpleParty myState) system (getSimpleParty myState) ret  };
+        assert { goodTransition (getSimpleParty myState) system (getSimpleParty myState) ret  }; (*unfold goodTransition*)
+        (myState, ret)
+      )
+    | PublicKeyAccount _ _ _ ->
+      let ret = { (emptyUpdate system) with timeProcessedTo = system.currentTime; } in
+      assert { goodTransitionForClosing (getSimpleParty myState) system (getSimpleParty myState) ret  }; (*unfold goodTransitionForClosing *)
+      assert { goodTransition (getSimpleParty myState) system (getSimpleParty myState) ret  };
+      (myState, ret)
+    end
+  | None ->
+    let ret = { (emptyUpdate system) with
+      timeProcessedTo = system.currentTime; } in
+    assert { goodTransition (getSimpleParty myState) system (getSimpleParty myState) ret  }; (* unfold goodTransition *)
+    (myState, ret)
+  end
+  
+  
+  (*verify : ok *)
+  let function reactToDispute (myState: partyStateT) (system : partySystemView) : (partyStateT, updateRecT) =
+  requires { agreement system.sigState myState }
+  requires { goodParty myState }
+  requires { goodView system }
+  returns { | (newState, update) -> 
+    goodTransition myState.getSimpleParty system newState.getSimpleParty update /\
+    update.timeProcessedTo = system.currentTime /\
+    partyInvariant newState update.newSigState /\
+    noMoneyTransfer update
+  }
+    match myState.state with
+    | BeforeCommitment _ ->
+      let ret = { (emptyUpdate system) with
+        timeProcessedTo = system.currentTime; } in
+      (myState, ret)
+    | AfterCommitment dataAboutChannel ->
+      reactToDisputeInner myState dataAboutChannel system
+    end
+  
+  
+  
+  
+  let predicate isAfterCommitment (state: stateT) =
+    match state with
+    | AfterCommitment _ -> true
+    | _ -> false
+    end
+  
+  (*verify : ok *)
+  let function concludeOpeningIfFundingTxOnChainInner (myState: partyStateT) (dataAboutChannel : channelDataT) (system : partySystemView)
+    : (partyStateT, updateRecT) =
+  requires { isAfterCommitment myState.state }
+  requires { agreement system.sigState myState }
+  requires { goodParty myState }
+  requires { myState.state = AfterCommitment dataAboutChannel }
+  requires { dataAboutChannel.innerState = WaitingForFundingTxInclusion }
+  returns { | (newState, update) ->
+    goodTransition myState.getSimpleParty system newState.getSimpleParty update /\
+    partyInvariant newState update.newSigState /\
+    noTimeUpdate update system /\
+    noMoneyTransfer update }
+  if isSpent_comp dataAboutChannel.getFundingTx.expectedContractStatusMoveOwnCoins system.gammaState then (
+    let newData =  { dataAboutChannel with innerState = ChannelReadySentByFunder } in
+    assert { goodChannelData newData myState.partySide };
+    let newParty = { myState with
+        state = AfterCommitment newData;
+      } in
+    assert { forall msg sig. messageSignatureIn (newParty.messagesSigned) (SignableSplit msg) sig ->
+      (signedSplitsSpec dataAboutChannel (newParty.revocationSigs) msg &&
+      signedSplitsSpec newData (newParty.revocationSigs) msg) };
+    assert { signableTXOnlyAboutOurChannel newParty by signableTXOnlyAboutOurChannel myState };
+    assert { goodParty newParty }; (*unfold goodParty *)
+    assert { partyInvariant newParty (system.sigState) };
+    let ret = { (emptyUpdate system) with
+      msgsToSendToCounterParty = Cons ChannelReadyByFunder Nil;} in
+    (newParty, ret)
+  ) else
+    (myState, emptyUpdate system)
+
+  (*verify : ok *)
+  let function concludeOpeningIfFundingTxOnChain (myState: partyStateT) (system : partySystemView) : (partyStateT, updateRecT) =
+  requires { agreement system.sigState myState }
+  requires { goodParty myState }
+  returns { | (newState, update) ->
+    goodTransition myState.getSimpleParty system newState.getSimpleParty update /\
+    partyInvariant newState update.newSigState /\
+    noTimeUpdate update system /\
+    noMoneyTransfer update }
+    match myState.state with
+    | BeforeCommitment _ -> (myState, emptyUpdate system) (* not empty update - moneyMovedTOChannel should be zero and so on *)
+    | AfterCommitment dataAboutChannel ->
+      match dataAboutChannel.innerState with
+      | WaitingForFundingTxInclusion -> concludeOpeningIfFundingTxOnChainInner myState dataAboutChannel system 
+      | _ -> (myState, emptyUpdate system)
+      end
+    end
+  
+  
+  use partyInterface.GoodTransitionTransitiveLemmas
+  
+  let function partyProcessMsg (myState: partyStateT) (msg : partyInputT) (system : partySystemView)
+                     : (partyStateT, updateRecT) =
+  requires { partyInvariant myState system.sigState }
+  requires { gammaCoherent system.gammaState }
+  requires { goodView system }
+  returns { | (newState, update) ->
+    goodTransition myState.getSimpleParty system newState.getSimpleParty update /\
+    partyInvariant newState update.newSigState /\
+    update.timeProcessedTo = system.currentTime /\
+    update.moneySentInChannel <= allowedOnChannelLoss msg /\
+    update.moneySentOnChain <= allowedOnChainLoss msg /\
+    (msg = FromEnv CloseNow -> newState.getSimpleParty.closingChannel)
+    }
+    let (party0, step0) = reactToDispute myState system in
+    let state0 = applyUpdateRec system step0 in
+    let (party1, concludeStep) = concludeOpeningIfFundingTxOnChain party0 state0 in
+    let state1 = applyUpdateRec state0 concludeStep in
+    let update1 = combineUpdateRecs step0 concludeStep in
+    assert { applyUpdateRec system update1 = state1 };
+    goodTransitionTransitive myState.getSimpleParty party0.getSimpleParty party1.getSimpleParty step0 concludeStep system;
+    assert { goodTransition myState.getSimpleParty system party1.getSimpleParty update1 };
+    if not validEnvMsg party1 msg then (party1, update1) else (
+    match party1.state with
+    | AfterCommitment _dataAboutChannel ->
+      match msg with
+      | FromParty innerMsg ->
+        let (party2, step) = (receivePayOffChainMessageFromParty party1 state1 innerMsg) in
+        let update2 = combineUpdateRecs update1 step in
+        (party2, update2)
+      | FromEnv (TransferOnChannel amount) ->
+        (*use validMsg to prove that we are in standby *)
+        let (party2, step) = (initiateTransfer party1 state1 amount) in
+        let update2 = combineUpdateRecs update1 step in
+        (party2, update2)
+      | FromEnv CloseNow ->
+        let (party2, step) = (openDispute party1 state1) in
+        let update2 = combineUpdateRecs update1 step in
+        (party2, update2)
+      | FromEnv (TransferOnChain _ _) ->
+        let (party2, step) = (payOnChain party1 state1 msg) in
+        let update2 = combineUpdateRecs update1 step in
+        (party2, update2)
+      | FromEnv (EnvOpenChannel _ _ _) (* ignore environment *)
+      | FromEnv JustCheckGamma -> (party1, update1)
+      end
+    | BeforeCommitment _stateOpening ->
+      match msg with
+      | FromParty innerMsg ->
+        let (party2, step) = (receiveOpenMessageFromParty party1 state1 innerMsg) in
+        let update2 = combineUpdateRecs update1 step in
+        (party2, update2)
+      | FromEnv (TransferOnChain _ _) ->
+        let (party2, step) = (payOnChain party1 state1 msg) in
+        let update2 = combineUpdateRecs update1 step in
+        (party2, update2)
+      | FromEnv (EnvOpenChannel amount totalAmount sourceId) ->
+        let (party2, step) = (openChannel party1 state1 amount totalAmount sourceId) in
+        let update2 = combineUpdateRecs update1 step in
+        (party2, update2)
+      | FromEnv JustCheckGamma -> (* nothing else to do *) (party1, update1)
+      | FromEnv CloseNow ->
+        let (party2, step) = (openDispute party1 state1) in
+        let update2 = combineUpdateRecs update1 step in
+        (party2, update2)
+      | _ -> absurd
+      end
+    end
+    )
+  
+  let function initialPartyState (side : partyT) (onChainBalance : amountT) : partyStateT =
+    requires { onChainBalance >= 0 }
+    returns { | pA ->
+        goodParty pA /\
+        agreement emptySignatureState pA /\
+        pA.partySide = side /\
+        pA.getChannelBalanceExt = 0 /\
+        pA.balanceOnChain = onChainBalance /\
+        true
+    }
+    {
+      partySide=side;
+      messagesSigned = Nil;
+      revocationSigs = Nil;
+      state = BeforeCommitment ChannelNotOpened;
+      splitNonce=1;
+      partyNonce=1;
+      balanceOnChain = onChainBalance;
+      balanceOnChainExt = onChainBalance;
+    }
+  
+  let lemma partyInvariantPreservedWhenAdversarySigns (p : partyStateT)  (sigs1 sigs2 : signatureFunctionalityT) =
+  requires {signatureFunctionalityTransition (p.getSimpleParty).simplePartySide sigs1 sigs2}
+  requires {partyInvariant p sigs1}
+  ensures  {coherentOurSignatures sigs2 (p.partySide) (p.messagesSigned)}
+   assert {preserved p.partySide sigs1 sigs2 };
+   assert {coherentOurSignatures sigs1 (p.partySide) (p.messagesSigned)};
+   assert { coherentOurSignatures sigs2 (p.partySide) (p.messagesSigned)} (*unfold coherentOurSignatures *)
+  
+end (*HonestPartyInteractionsImplementation*)
+
+
+module HonestPartyImplementationSpec : partyInterface.AbstractPartySpec
+  use basicTypes.BasicTypes
+  use basicTypes.Util
+  
+  use signaturesFunctionality.SignaturesFunctionality
+  use gamma.GammaInvariant
+  use partyInterface.SimplePartyTypes
+  use partyInterface.SimplePartyTypes
+  use partyInterface.GoodTransition
+  use honestPartyType.HonestPartyType
+  use HonestPartyInteractionsImplementation
+  
+  type partyStateT = HonestPartyType.partyStateT
+  predicate partyInvariant (p : partyStateT) (sigs : signatureFunctionalityT) = HonestPartyType.partyInvariant (p : partyStateT) (sigs : signatureFunctionalityT)
+  
+  let function initialPartyState (p : partyT) (onChainBalance : amountT) : partyStateT =
+  requires { onChainBalance >= 0 }
+    HonestPartyInteractionsImplementation.initialPartyState p onChainBalance
+  
+  let function partyProcessMsg (p : partyStateT) (msg : partyInputT) (system : partySystemView) : (partyStateT, updateRecT) =
+  requires { partyInvariant p system.sigState }
+  requires { gammaCoherent system.gammaState }
+  requires { system.lastWoken <= system.currentTime }
+    HonestPartyInteractionsImplementation.partyProcessMsg p msg system
+  
+  let function getSimpleParty (p : partyStateT) = p.HonestPartyType.getSimpleParty
+  
+  
+  let lemma partyInitialInvariant (p : partyT) (onChainBalance : amountT) (sigs : signatureFunctionalityT)
+  requires {forall msg sig. not (verify p msg sig sigs)}
+  requires { onChainBalance >= 0 }
+  ensures  {partyInvariant (initialPartyState p onChainBalance) sigs}
+    = ()
+
+  let lemma partyInitialCorrectSide (p : partyT) (onChainBalance : amountT)
+  requires { onChainBalance >= 0 }
+  ensures  {(initialPartyState p onChainBalance).getSimpleParty.simplePartySide = p}
+   = ()
+  
+  let lemma partyInitalOnChainBalance (p : partyT) (onChainBalance : amountT)
+  requires { onChainBalance >= 0 }
+  ensures  {(initialPartyState p onChainBalance).getSimpleParty.onChainBalance = onChainBalance}
+   = ()
+  
+  let lemma partyInitialChannelClose (p : partyT) (onChainBalance : amountT) 
+  requires { onChainBalance >= 0 }
+  ensures {not ((initialPartyState p onChainBalance).getSimpleParty.channelInfo.tracksAChannel)}
+   = ()
+  
+  let lemma partyInitialNotClosing (p : partyT) (onChainBalance : amountT)
+  requires { onChainBalance >= 0 }
+  ensures {not ((initialPartyState p onChainBalance).getSimpleParty.closingChannel)}
+   = ()
+ 
+  let lemma partyInvariantPreservedWhenProcessMsg (p : partyStateT) (msg : partyInputT) (system : partySystemView) (newP : partyStateT) (update : updateRecT)
+  requires {partyProcessMsg p msg system = (newP, update)}
+  requires {partyInvariant p system.sigState}
+  requires {gammaCoherent system.gammaState }
+  requires { system.lastWoken <= system.currentTime }
+  ensures  {partyInvariant newP update.newSigState}
+   = ()
+  
+  let lemma partyInvariantPreservedWhenAdversarySigns (p : partyStateT)  (sigs1 sigs2 : signatureFunctionalityT)
+  requires {signatureFunctionalityTransition (p.getSimpleParty).simplePartySide sigs1 sigs2}
+  requires {partyInvariant p sigs1}
+  ensures  {partyInvariant p sigs2}
+   = ()
+  
+  let lemma partyInvariantSoGoodSplitsAndRevocationsRecord (p : partyStateT) (sigState : signatureFunctionalityT)
+  requires {partyInvariant p sigState}
+  ensures  {goodSimpleParty  p.getSimpleParty sigState}
+   = ()
+
+  let lemma partyProcessMsgGoodTransition (p : partyStateT) (msg : partyInputT) (system : partySystemView) (newP : partyStateT) (update : updateRecT) 
+  requires {partyProcessMsg p msg system = (newP, update)}
+  requires {partyInvariant p system.sigState}
+  requires {gammaCoherent system.gammaState }
+  requires { system.lastWoken <= system.currentTime }
+  ensures {goodTransition p.getSimpleParty system newP.getSimpleParty update}
+   = ()
+  
+  let lemma upToDateAfterProcessMsg (p : partyStateT) (msg : partyInputT) (system : partySystemView) (update : updateRecT) =
+  requires {(partyProcessMsg p msg system).snd = update}
+  requires {partyInvariant p system.sigState}
+  requires {gammaCoherent system.gammaState }
+  requires { system.lastWoken <= system.currentTime }
+  ensures {update.timeProcessedTo = system.currentTime}
+   match partyProcessMsg p msg system with
+   | (_newState, update2) ->
+     assert { update2 = update };
+     assert { update.timeProcessedTo = system.currentTime }
+   end 
+  
+  let lemma partyProcessMsgSpendsWhatMsgAllows (p : partyStateT) (msg : partyInputT) (system : partySystemView) (update : updateRecT) =
+  requires {(partyProcessMsg p msg system).snd = update}
+  requires {partyInvariant p system.sigState}
+  requires {gammaCoherent system.gammaState }
+  requires { system.lastWoken <= system.currentTime }
+  ensures {update.moneySentOnChain <= msg.allowedOnChainLoss}
+  ensures {update.moneySentInChannel <= msg.allowedOnChannelLoss}
+  match partyProcessMsg p msg system with
+   | (_newState, update2) ->
+     assert { update2 = update };
+     assert {update.moneySentInChannel <= msg.allowedOnChannelLoss}
+   end
+  
+  let lemma partyClosingAfterClosingRequest (p : partyStateT) (system : partySystemView) =
+  requires {partyInvariant p system.sigState}
+  requires {gammaCoherent system.gammaState }
+  requires { system.lastWoken <= system.currentTime }
+  ensures {(partyProcessMsg p (FromEnv CloseNow) system).fst.getSimpleParty.closingChannel}
+  match partyProcessMsg p (FromEnv CloseNow) system with
+  | (_newState, _update) ->
+     assert {(partyProcessMsg p (FromEnv CloseNow) system).fst.getSimpleParty.closingChannel}
+  end
+  
+end (*HonestPartyImplementationSpec *)
+

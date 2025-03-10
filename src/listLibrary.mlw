@@ -1,0 +1,1242 @@
+(*
+  Non-Lightning Network specific module
+  Contains functions and lemmas about lists.
+*)
+module ListLibrary
+  use basicTypes.Prelude
+  use list.Append
+  use export basicTypes.Util
+
+  predicate includedList (l1 l2 : list 'a) =
+    forall x. num_occ x l1 > 0 -> num_occ x l2 > 0
+
+  predicate listEq (l1 l2 : list 'a) =
+    forall x. num_occ x l1 > 0 <-> num_occ x l2 > 0
+
+  predicate listStrongEq (l1 l2 : list 'a) =
+    forall x. num_occ x l1 = num_occ x l2
+
+  predicate isListing (p : 'a -> bool) (l : list 'a) =
+    (forall x. num_occ x l > 0 -> p x) /\
+    (forall x. p x -> num_occ x l = 1)
+  
+  (*We use `_comp` suffix for functions that take comparator as an argument.
+  They are equal to the non computable variant -- for example `let rec function num_occ_comp` corresponds to `rec function num_occ` from standard library. Non computable variants use true equality internally, therefore do not require argument `compare`.  *)
+  let rec function num_occ_comp (compare: 'a -> 'a -> bool) (x: 'a) (l: list 'a) =
+  requires { forall x y. compare x y <-> x = y }
+  ensures { result = num_occ x l }
+  variant { l }
+    match l with
+    | Nil -> 0
+    | Cons head tail ->
+      (if compare head x then 1 else 0) + num_occ_comp compare x tail
+    end
+
+  predicate member (x : 'a) (l : list 'a) =
+    num_occ x l > 0
+
+  let predicate member_comp (compare: 'a -> 'a -> bool) (x : 'a) (l : list 'a) =
+  requires { forall x y. compare x y <-> x = y }
+  ensures { result <-> member x l }
+    num_occ_comp compare x l > 0
+
+  let lemma noElementsSoNil (l : list 'a) =
+  requires {forall x . num_occ x l = 0}
+  ensures { l = Nil}
+  match l with
+    | Cons _x _xs -> absurd
+    | Nil -> ()
+  end
+
+  let rec lemma memberAppend (x : 'a) (l1 : list 'a) (l2 : list 'a) =
+  requires { member x (l1 ++ l2) }
+  ensures  { member x l1 \/ member x l2}
+  ()
+
+  let rec lemma memberAppendL (x : 'a) (l1 : list 'a) (l2 : list 'a) =
+  requires { member x l1}
+  ensures  { member x (l1 ++ l2)}
+  ()
+
+  let rec ghost function makeUnique (l : list 'a) : list 'a =
+  ensures {forall x. num_occ x result <= 1}
+  ensures {forall x. num_occ x l > 0 <-> num_occ x result = 1}
+  match l with
+    | Nil -> Nil
+    | Cons x l' ->
+      let r = makeUnique l' in
+      if num_occ x r = 0 then Cons x r else r
+  end
+
+  let rec function makeUnique_comp (compare: 'a -> 'a -> bool) (l : list 'a) : list 'a =
+  requires { forall x y. compare x y <-> x = y }
+  ensures  { result = makeUnique l }
+  match l with
+    | Nil -> Nil
+    | Cons x l' ->
+      let r = makeUnique_comp compare l' in
+      if num_occ_comp compare x r = 0 then Cons x r else r
+  end
+
+  lemma uniqueEq : forall l : list 'a. listEq l (makeUnique l)
+
+  let lemma makeUniqueInclusion (l1 l2 : list 'a) =
+  requires {forall x . num_occ x l1 <= num_occ x l2}
+  ensures  {forall x . num_occ x (makeUnique l1) <= num_occ x (makeUnique l2)}
+  ()
+
+  let lemma numOccComPNumOcc (compare: 'a -> 'a -> bool) =
+  requires { forall x y: 'a. compare x y <-> x = y }
+  ensures { forall l : list 'a. forall x. num_occ x l = num_occ_comp compare x l }
+  ()
+
+  predicate everyListElem (p : 'a -> bool) (l : list 'a) =
+    forall x. num_occ x l > 0 -> p x
+
+  predicate noListElem (p : 'a -> bool) (l : list 'a) =
+    forall x : 'a. p x -> num_occ x l = 0
+
+  let lemma equivConsEquiv (x : 'a) (l1 l2 : list 'a) =
+  requires {forall z. num_occ z (Cons x l1) = num_occ z (Cons x l2)}
+  ensures {forall z. num_occ z l1 = num_occ z l2}
+  assert {forall z. z <> x ->  num_occ z l1 = num_occ z (Cons x l1)};
+  assert {forall z. z <> x ->  num_occ z l2 = num_occ z (Cons x l2)};
+  ()
+
+  let rec function nth3 (i : int) (l : list 'a) : 'a =
+  variant {l}
+  requires { 0 <= i < length l }
+    match l with
+    | Nil -> absurd
+    | Cons hd tl ->
+      if i = 0 then hd else nth3 (i-1) tl
+    end
+
+
+
+ lemma consNth2 : forall l:list 'a, x:'a, i:int.  0 <= i < length l -> nth3 i l = nth3 (i+1) (Cons x l)
+ let lemma consNth3 (l:list 'a)  (x:'a)  (i:int)  requires {1 <= i < length l + 1} ensures { nth3 i (Cons x l) = nth3 (i-1) l } = ()
+
+
+ let rec function find2 (p: 'a -> bool) (l : list 'a) : option int =
+  variant {l}
+  returns {
+    | None -> noListElem p l
+    | Some x -> (0 <= x < length l) /\ let y = nth3 x l in num_occ y l > 0 /\ p y
+  }
+  match l with
+  | Nil -> None
+  | Cons hd tl ->
+    if (p hd) then
+      Some 0
+    else
+      match find2 p tl with
+      | None -> None
+      | Some x ->
+         Some (x+1)
+      end
+  end
+
+  let lemma find2isSomePerm (p : 'a -> bool) (l1 : list 'a) (l2 : list 'a) =
+  requires {forall x . num_occ x l1 = num_occ x l2 }
+  requires {isSome (find2 p l1)}
+  ensures  {isSome (find2 p l2)}
+  if isSome (find2 p l2) then assert {isSome (find2 p l2)} else
+  (assert {forall x . num_occ x l2 > 0 -> not p x};
+  match find2 p l1 with
+    | None -> absurd
+    | Some x ->
+        let y = nth3 x l1 in
+        assert {(num_occ y l1) > 0 };
+        assert {p y};
+        assert {num_occ y l2 > 0};
+        assert {find2 p l2 = None};
+        assert {noListElem p l2};
+        assert {forall z. num_occ z l2 > 0 -> not p z};
+        absurd
+ end)
+
+
+  let rec lemma nthFinds (i : int) (l : list 'a) =
+  variant { i }
+  requires { 0 <= i < length l }
+  ensures { num_occ (nth3 i l) l > 0 }
+  match l with
+  | Nil -> absurd
+  | Cons _hd tl ->
+    if i = 0 then () else nthFinds (i-1) tl
+  end
+
+  predicate equal (x : 'a) (y : 'a) =
+    x = y
+
+  let lemma nthComplete (l : list 'a) (x : 'a) =
+  requires { num_occ x l > 0}
+  ensures { exists i : int. 0 <= i < length l /\ nth3 i l = x }
+    match find2 (equal x) l with
+    | None -> ()
+    | Some i -> assert { nth3 i l = x}
+    end
+
+
+  let rec function filter (p : 'a -> bool) (l : list 'a) =
+    match l with
+    | Nil -> Nil
+    | Cons hd tl ->
+      let rest = filter p tl in
+      if p hd then Cons hd rest else rest
+    end
+
+  let rec lemma filterSpec (p : 'a -> bool) (l : list 'a) : unit =
+  ensures { forall x. p x -> num_occ x l = num_occ x (filter p l) }
+  ensures { forall x. not p x -> num_occ x (filter p l) = 0 }
+  ensures { forall x. num_occ x (filter p l) > 0 -> num_occ x l > 0 /\ p x }
+  variant {l}
+  match l with
+    | Nil -> ()
+    | Cons _hd tl ->
+      filterSpec p tl
+    end
+
+  (*version of spec above, when you could instantiate x from forall *)
+  let rec filterSpec2 (p : 'a -> bool) (hd : 'a) (tl : list 'a) =
+  ensures { not p hd -> filter p (Cons hd tl) = filter p tl }
+  ensures { p hd -> filter p (Cons hd tl) = Cons hd (filter p tl) }
+    ()
+
+  let lemma filterAndMember (p : 'a -> bool) (l : list 'a) (x : 'a) =
+  requires { p x }
+  requires { member x l }
+  ensures  { member x (filter p l) }
+    ()
+
+  let lemma filterMaintainsInclusion (l1 l2: list 'a) (p: 'a -> bool) =
+  requires { forall x: 'a. num_occ x l1 <= num_occ x l2 }
+  ensures { forall x: 'a. num_occ x (filter p l1) <= num_occ x (filter p l2) }
+    ()
+
+  let lemma filterShuffle (p : 'a -> bool) (l1 l2 : list 'a) =
+  requires { forall x. num_occ x l1 = num_occ x l2 }
+  ensures { forall y. num_occ y (filter p l1) = num_occ y (filter p l2) }
+    ()
+
+  let lemma weakerFilterGivesSuperset (p1 p2: 'a -> bool) (l: list 'a) =
+  requires { forall x: 'a. p1 x -> p2 x }
+  ensures  { forall x: 'a. num_occ x (filter p2 l) >= num_occ x (filter p1 l) }
+    ()
+
+  (*stronger then above, as gives full = *)
+  let rec lemma filterEq (p1 p2 : 'a -> bool) (l : list 'a) =
+  requires { forall x. num_occ x l > 0 -> p1 x = p2 x }
+  ensures { filter p1 l = filter p2 l }
+    match l with
+    | Nil -> ()
+    | Cons _hd tl ->
+      filterEq p1 p2 tl
+    end
+
+  let rec lemma filterId (p : 'a -> bool) (l : list 'a) =
+  requires { forall x. num_occ x l > 0 -> p x }
+  ensures { filter p l = l }
+  match l with
+  | Nil -> ()
+  | Cons _hd tl -> filterId p tl
+  end
+
+  let rec lemma filterAppend (p : 'a -> bool) (l1 l2 : list 'a) =
+  ensures { filter p l1 ++ filter p l2 = filter p (l1 ++ l2) }
+  match l1 with
+  | Nil -> ()
+  | Cons _hd tl ->
+    filterAppend p tl l2
+  end
+
+
+
+  let rec function map (f : 'a -> 'b) (l : list 'a) =
+    match l with
+    | Nil -> Nil
+    | Cons elem tail -> Cons (f elem) (map f tail)
+    end
+
+
+  let rec lemma mapExists (f : 'a -> 'b) (l : list 'a) (y : 'b) =
+  variant {l}
+  requires {member y (map f l)}
+  ensures {exists x. member x l /\ y = f x}
+  match l with
+    | Cons x xs ->
+      if equal y (f x) then assert {member x l} else
+      mapExists f xs y
+    | Nil -> absurd
+  end
+
+
+  let rec lemma mapConcat (f : 'a -> 'b) (l1 l2 : list 'a) =
+  ensures { map f (l1++l2) = (map f l1) ++ (map f l2) }
+    match l1 with
+    | Nil -> ()
+    | Cons _elem tail -> mapConcat f tail l2
+    end
+
+  lemma mapConcatL : forall f : 'a -> 'b. forall l1 l2 : list 'a. map f (l1 ++ l2) = (map f l1) ++ (map f l2)
+
+  let rec lemma mapLength (f : 'a -> 'b) (l : list 'a) =
+  variant {l}
+  ensures { length (map f l) = length l }
+   match l with
+   | Nil -> ()
+   | Cons _hd tl -> mapLength f tl
+   end
+
+  let rec lemma mapSpec (f : 'a -> 'b) (l : list 'a) ( i : int) =
+  variant {l}
+  requires { 0 <= i < length l }
+  ensures { nth3 i (map f l) = f (nth3 i l) }
+   match l with
+   | Nil -> absurd
+   | Cons hd tl ->
+     if i = 0 then
+       assert {nth3 i (map f l) = f hd = f (nth3 0 l) }
+     else (
+       mapSpec f tl (i-1);
+       mapLength f tl;
+       assert { nth3 i (map f l) = nth3 i (Cons (f hd) (map f tl)) = nth3 (i-1) (map f tl) = f (nth3 (i-1) tl) = f (nth3 i l) }
+     )
+   end
+
+  let rec lemma mapSpec2 (f : 'a -> 'b) (l : list 'a) =
+  variant {l}
+  ensures { forall x. num_occ x (map f l) > 0 <-> exists y. num_occ y l > 0 /\ f y = x }
+   match l with
+   | Nil -> assert { map f l = Nil }
+   | Cons _hd tl ->
+     mapSpec2 f tl
+   end
+   
+  lemma mapSpec3 : forall f : 'a -> 'b. forall l : list 'a. forall x. num_occ (f x) (map f l) = 0 -> num_occ x l = 0
+
+  let lemma mapMaintainsInclusion (l1 l2: list 'a) (p: 'a -> 'b) =
+  requires { includedList l1 l2 }
+  ensures { includedList (map p l1) (map p l2) }
+    ()
+
+  let rec ghost function mapPermAuxRemove (x : 'a) (l : list 'a) (f: 'a -> 'b) : list 'a =
+  requires {num_occ x l > 0}
+  ensures {forall z. num_occ z (Cons x result) = num_occ z l}
+  ensures {forall z. num_occ z (map f (Cons x result)) = num_occ z (map f l )} 
+  variant {length l}
+  match l with
+  | Nil -> absurd
+  | Cons x' l' ->
+      if equal x x' then l' else
+      let l'' = mapPermAuxRemove x l' f in
+      Cons x' l''
+  end
+
+
+  let rec lemma mapPerm (l1 l2 : list 'a) (f: 'a -> 'b) =
+  requires {forall x. num_occ x l1 = num_occ x l2}
+  ensures {forall x. num_occ x (map f l1) = num_occ x (map f l2)}
+  variant {length l1}
+  match (l1, l2) with
+    | (Nil, Nil) -> assert {forall x. num_occ x (map f l1) = num_occ x (map f l2)};
+    | (Cons x l1', l2) ->
+      assert {num_occ x l2 > 0};
+      let l2' = mapPermAuxRemove x l2 f in
+      assert {forall z. num_occ z (Cons x l1') = num_occ z (Cons x l2')};
+      assert {forall z. z = x \/ z <> x};
+      assert {forall z : 'a. forall  x l. z <> x -> num_occ z (Cons x l) = num_occ z l};
+      assert {forall x . num_occ x l1' = num_occ x l2'};
+      let _ = mapPerm l1' l2' f in
+      let _r1 = Cons x l1' in
+      let _r2 = Cons x l2' in
+      assert {forall z. num_occ z (map f l2) = num_occ z (Cons (f x) (map f l2'))};
+      assert {forall z. num_occ z (map f l1) = num_occ z (map f l2)};
+    | _ -> absurd
+  end
+
+  let lemma mapListEq (l1 l2 : list 'a) (f: 'a -> 'b) =
+  requires {listEq l1 l2}
+  ensures  {listEq (map f l1) (map f l2)}
+  ()
+
+  let lemma mapListStrongEq (l1 l2 : list 'a) (f: 'a -> 'b) =
+  requires {listStrongEq l1 l2}
+  ensures  {listStrongEq (map f l1) (map f l2)}
+  ()
+
+  let lemma mapFunEq (l : list 'a) (f1 : 'a -> 'b) (f2 : 'a -> 'b) =
+  requires {forall x . f1 x = f2 x }
+  ensures {map f1 l = map f2 l}
+  ()
+
+  predicate counterImg (f : 'a -> 'b) (y : 'b) (x : 'a) = equal (f x) y
+
+  let rec lemma mapSpecNum (f : 'a -> 'b) (l : list 'a) (y : 'b) =
+  ensures { num_occ y (map f l) = length (filter (counterImg f y) l) }
+  match l with
+  | Nil -> ()
+  | Cons hd tl ->
+    if equal (f hd) y then
+      mapSpecNum f tl y
+    else
+      let _ = assert { filter (counterImg f y) l = filter (counterImg f y) tl } in
+      mapSpecNum f tl y;
+  end
+
+  lemma mapCons : forall f : 'a -> 'b . forall  x : 'a. forall  l : list 'a .
+    map f (Cons x l) = Cons (f x) (map f l)
+
+  lemma mapNil : forall f : 'a -> 'b. map f Nil = Nil
+
+  let rec lemma mapNumOccGeq (f : 'a -> 'b) (l : list 'a) (x : 'a) (k : int) =
+  requires { num_occ x l >= k }
+  ensures  { num_occ (f x) (map f l) >= k}
+  variant  { length l }
+  match l with
+    | Nil -> assert {k <= 0};
+    | Cons y ys -> if equal x y then
+                      mapNumOccGeq f ys x (k-1)
+                   else
+                      mapNumOccGeq f ys x k
+  end
+
+  let rec lemma mapInversion (f : 'a -> 'b) (pa : 'a -> bool) (pb : 'b -> bool) (l : list 'a) =
+  requires { forall x . member x l -> pa x }
+  requires { forall x . pa x -> pb (f x) }
+  ensures  { forall x. member x (map f l) -> pb x}
+  variant {length l}
+  match l with
+    | Nil -> ()
+    | Cons x xs -> assert {pa x}; assert {pb (f x)}; mapInversion f pa pb xs
+  end
+
+  let rec lemma mapWithInjection (f: 'a -> 'b) (l : list 'a) (a : 'a) (b : 'b) =
+  requires { forall x. f x = b -> x = a }
+  requires { member b (map f l) }
+  ensures  { member a l }
+  variant  { length l}
+  match l with
+    | Nil -> absurd;
+    | Cons x xs -> if equal (f x) b then (assert {x = a}; assert {member a l})
+                   else mapWithInjection f xs a b
+  end
+
+
+  let rec lemma mapComposeAux (f : 'a -> 'b) (g : 'b -> 'c) (l : list 'a) =
+  ensures { map g (map f l) = map (fun x -> g (f x)) l }
+  variant { length l }
+  match l with
+    | Nil -> ()
+    | Cons _x xs -> mapComposeAux f g xs
+   end
+
+  let lemma mapComposeRev (g : 'b -> 'c) (f : 'a -> 'b) (l : list 'a) =
+  ensures { map g (map f l) = map (fun x -> g (f x)) l }
+    mapComposeAux f g l
+
+  lemma mapCompose : forall f : 'a -> 'b. forall  g : 'b -> 'c. forall l : list 'a.
+    map g (map f l) = map (fun x -> (g (f x))) l
+  (*split_vc; apply mapComposeAux*)
+
+
+  let rec lemma mapId (l : list 'a) =
+  ensures {map (fun x -> x) l = l}
+  variant { length l }
+  match l with
+    | Nil -> ()
+    | Cons _x xs -> mapId xs
+  end
+
+  let rec function find1 (p: 'a -> bool) (l : list 'a) : option 'a =
+  variant { l }
+    match l with
+    | Nil -> None
+    | Cons elem tail -> if p elem then Some elem else find1 p tail
+    end
+
+  let rec function find (p: 'a -> bool) (l: list 'a) : option 'a =
+  variant { l }
+  ensures {
+    match result with
+    | None -> noListElem p l /\ filter p l = Nil
+    | Some x -> num_occ x l > 0 /\ p x
+    end
+  }
+  ensures { noListElem p l -> result = None }
+  ensures { result = find1 p l }
+    match l with
+    | Nil -> None
+    | Cons elem tail -> if p elem then Some elem else find p tail
+    end
+
+  lemma numOccConsEq : forall l : list 'a. forall x. num_occ x (Cons x l) = 1 + num_occ x l
+  lemma numOccConsNeq : forall l : list 'a. forall y. forall x. x <> y -> num_occ x (Cons y l) = num_occ x l
+
+  (* need comp variant? *)
+  let rec ghost function removeOne (elem : 'a) (l : list 'a) : list 'a =
+  variant { l }
+  requires { num_occ elem l <> 0 }
+    match l with
+      | Nil -> absurd
+      | Cons head tail -> if equal head elem then tail else  (Cons head (removeOne elem tail))
+    end
+
+  (* add comparator *)
+  let rec function removeOne_comp (compare: 'a -> 'a -> bool) (elem : 'a) (l : list 'a) : list 'a =
+  variant { l }
+  requires { forall x y. compare x y <-> x = y }
+  requires { num_occ elem l <> 0 }
+  ensures { result = removeOne elem l }
+    match l with
+      | Nil -> absurd
+      | Cons head tail -> if compare head elem then tail else  (Cons head (removeOne_comp compare elem tail))
+    end
+
+  let rec lemma removeOneSpec (elem : 'a) (l : list 'a)  =
+  requires { num_occ elem l <> 0 }
+  ensures { num_occ elem (removeOne elem l) = num_occ elem l - 1 }
+  ensures { forall x. x <> elem -> num_occ x (removeOne elem l) = num_occ x l }
+  variant {length l}
+  match l with
+    | Nil -> absurd
+    | Cons x xs -> if equal x elem then () else removeOneSpec elem xs
+  end
+
+  let rec lemma removeOneMapCommute (elem : 'a) (l : list 'a) (f : 'a -> 'b) =
+  requires { num_occ elem l <> 0}
+  requires { num_occ (f elem) (map f l) <= 1}
+  ensures { map f (removeOne elem l) = removeOne (f elem) (map f l)}
+  variant { length  l}
+  match l with
+    | Nil -> ()
+    | Cons x xs -> if equal x elem then
+                    (assert {f x = f elem};
+                    assert {map f (removeOne elem l) = removeOne (f elem) (map f l)})
+                   else
+                    (assert {f x <> f elem};
+                     let _ = removeOneMapCommute elem xs f in
+                     assert {map f (removeOne elem l) = removeOne (f elem) (map f l)})
+  end
+
+  let rec lemma removeOneMapNumOccEq (elem : 'a) (l : list 'a) (f : 'a -> 'b) =
+  variant {l}
+  requires {num_occ elem l > 0}
+  ensures { num_occ (f elem) (map f (removeOne elem l)) = num_occ (f elem) (map f l) - 1}
+  match l with
+    | Nil -> absurd
+    | Cons x xs -> if equal x  elem
+                   then assert {num_occ (f elem) (map f (removeOne elem l)) = num_occ (f elem) (map f l) - 1}
+                   else  removeOneMapNumOccEq elem xs f
+  end
+
+  let rec lemma removeOneMapNumOccNonEq (elem : 'a) (l : list 'a) (f : 'a -> 'b) =
+  variant {l}
+  requires {num_occ elem l > 0}
+  ensures { forall x . x <> f elem -> num_occ x (map f (removeOne elem l)) = num_occ x (map f l) }
+  match l with
+    | Nil -> absurd
+    | Cons x xs -> if equal x  elem
+                   then assert {num_occ (f elem) (map f (removeOne elem l)) = num_occ (f elem) (map f l) - 1}
+                   else  removeOneMapNumOccNonEq elem xs f
+  end
+
+  (*NEW*)
+  let rec lemma removeOneMapListStrongEq (x : 'a) (l : list 'a) (f : 'a -> 'b) =
+  variant {l}
+  requires { num_occ x l > 0 }
+  ensures { listStrongEq (map f (removeOne x l)) (removeOne (f x) (map f l)) }
+    match l with
+    | Nil -> absurd
+    | Cons hd tl ->
+      if equal x hd then (
+        assert { removeOne x l = tl };
+        assert { removeOne (f x) (map f l) = map f tl };
+        assert { listStrongEq (map f (removeOne x l)) (removeOne (f x) (map f l)) }
+      ) else (
+        removeOneMapListStrongEq x tl f;
+        assert { listStrongEq (map f (removeOne x l)) (removeOne (f x) (map f l)) }; (* finisher *)
+      )
+    end
+
+
+  let rec lemma mapMaintainsInclusionStrong (l1 l2 : list 'a) (f : 'a -> 'b) =
+  variant {l2}
+  requires {forall x . num_occ x l1 <= num_occ x l2 }
+  ensures {forall x . num_occ x (map f l1) <= num_occ x (map f l2)}
+  match l2 with
+    | Nil -> assert {forall x. num_occ x l1 = 0}; assert {l1 = Nil};
+    | Cons e ls2 -> if num_occ e l1 > 0 then
+        (let l1' = removeOne e l1 in
+        let _ = mapMaintainsInclusionStrong l1' ls2 f in
+        assert { forall x. x = f e \/ x <> f e};
+        assert { num_occ (f e) (map f l1) = num_occ (f e) (map f l1') + 1};
+        assert { num_occ (f e) (map f l2) = num_occ (f e) (map f ls2) + 1};
+        assert { forall x. x <> (f e) -> num_occ x (map f l1) = num_occ x (map f l1')};
+        assert { forall x. x <> (f e) -> num_occ x (map f l2) = num_occ x (map f ls2)};
+        assert { forall x. x <> (f e) -> num_occ x (map f l1) <= num_occ x (map f l2)};
+        assert { forall x. x = (f e) -> num_occ x (map f l1) <= num_occ x (map f l2)})
+      else
+        mapMaintainsInclusionStrong l1 ls2 f
+  end
+
+
+
+  let lemma emptyFilterMeansNoneFound (p: 'a -> bool) (l: list 'a) =
+    requires { length (filter p l) = 0 }
+    ensures { None = (find p l) }
+  ()
+
+  let lemma ifFoundInSublistThenFoundInSuperlist (p : 'a -> bool) (sublist superlist : list 'a) =
+    requires {forall x. num_occ x sublist <= num_occ x superlist }
+    requires {isSome (find p sublist) }
+    ensures  {isSome (find p superlist) }
+  match find p sublist with
+  | None -> absurd
+  | Some elem ->
+    assert { num_occ elem sublist > 0 };
+    assert { p elem };
+    match find p superlist with
+    | None -> absurd
+    | Some _ -> ()
+    end
+  end
+
+  let lemma ifFoundInListThenFoundInOneLongerList (p: 'a -> bool) (l: list 'a) (x: 'a) =
+    requires { isSome (find p l) }
+    ensures  { isSome (find p (Cons x l)) }
+  ()
+
+  let lemma extendingMatchingListWithNonmatchingElemGivesMatchingList (p: 'a -> bool) (l: list 'a) (x: 'a) =
+    requires { not p x }
+    requires { isSome (find p (Cons x l)) }
+    ensures  { isSome (find p l) }
+  ()
+
+  let lemma ifStrongPredFindsThenWeakPredFinds (p1 p2: 'a -> bool) (l: list 'a) =
+    requires { forall elem. p1 elem -> p2 elem }
+    requires { isSome (find p1 l) }
+    ensures  { isSome (find p2 l) }
+  match find p1 l with
+  | None -> absurd
+  | Some elem ->
+    assert { num_occ elem l > 0 };
+    match find p2 l with
+    | None -> absurd
+    | Some _ -> ()
+    end
+  end
+
+  (* FOLD_LEFT *)
+
+  let rec function fold_left (f: 'b -> 'a -> 'b) (acc: 'b) (l: list 'a) : 'b =
+    match l with
+    | Nil      -> acc
+    | Cons x r -> fold_left f (f acc x) r
+    end
+
+  lemma fold_left_cons:
+    forall x : 'a, l2: list 'a, f: 'b -> 'a -> 'b, acc : 'b.
+    fold_left f acc (Cons x l2) = fold_left f (f acc x) l2
+
+  let rec ghost function decompose (x : 'a) (l : list 'a) : (list 'a, list 'a) =
+  variant {l}
+  requires { num_occ x l > 0}
+  returns { (l1, l2) -> l1 ++ (Cons x l2) = l }
+    match l with
+    | Nil -> absurd
+    | Cons hd tl ->
+      if equal hd x then
+        (Nil, tl)
+      else
+        let (l1, l2) = decompose x tl in
+        (Cons hd l1, l2)
+    end
+
+  let rec lemma fold_leftAppend (f : 'b -> 'a -> 'b) (acc : 'b) (l1 l2 : list 'a) =
+  variant {l1}
+  ensures { fold_left f acc (l1++l2) = fold_left f (fold_left f acc l1) l2 }
+  match l1 with
+  | Nil -> ()
+  | Cons hd tl ->
+    fold_leftAppend f (f acc hd) tl l2;
+    assert { l1++l2 = Cons hd (tl ++ l2) };
+    assert { fold_left f acc (l1 ++ l2) =
+            fold_left f acc (Cons hd (tl ++ l2)) =
+            fold_left f (f acc hd) (tl ++ l2) =
+            fold_left f (fold_left f (f acc hd) tl) l2 =
+            fold_left f (fold_left f acc l1) l2 }
+  end
+
+  let function concatGen (x : list 'a) (l : list (list 'a)) : list 'a =
+    fold_left (fun acc x -> acc++x) x l
+
+  let rec lemma concatProp (x y : list 'a) (l : list (list 'a))  =
+  ensures { x ++ concatGen y l = concatGen (x++y) l }
+    match l with
+    | Nil -> ()
+    | Cons hd tl ->
+      concatProp x (y++hd) tl
+    end
+
+  let function concat (l : list (list 'a)) = concatGen Nil l
+
+  let function sum (l : list int) : int =
+    fold_left (+) 0 l
+
+
+  let rec lemma sumInFront1 (l : list int) =
+  ensures {forall x : int. fold_left (+) x l = x + fold_left (+) 0 l }
+    match l with
+    | Nil -> ()
+    | Cons _x tl -> sumInFront1 tl
+    end
+
+  lemma sumInFront : forall l : list int, x : int. sum (Cons x l) = x + sum l
+
+  let lemma sumAppend (l1 l2 : list int) =
+  ensures { sum (l1++l2) = sum l1 + sum l2 }
+    ()
+
+  let rec lemma sumNonNeg (l : list int) =
+  requires { forall x. member x l -> x >= 0 }
+  ensures  { sum l >= 0 }
+  match l with
+  | Nil -> ()
+  | Cons _hd tl ->
+    assert {forall x . member x tl -> member x l};
+    sumNonNeg tl
+  end
+
+  let rec lemma sumIsOrderIndependent (l1 l2 : list int) =
+  variant { length l1 }
+  requires { forall x. num_occ x l1 = num_occ x l2 }
+  ensures { sum l1 = sum l2 }
+  match l1 with
+  | Nil ->
+    match l2 with
+    | Nil -> ()
+    | Cons hd _tl -> assert { num_occ hd l2 > 0 = num_occ hd l1 }; absurd
+    end
+  | Cons hd tl ->
+    let (l2p, l2pp) = decompose hd l2 in
+    assert { forall y. y<>hd -> num_occ y tl = num_occ y l1 = num_occ y (l2p++(Cons hd l2pp)) = num_occ y l2p + num_occ y l2pp };
+    sumIsOrderIndependent tl (l2p++l2pp);
+    assert { sum l1 = hd + sum tl =  hd + sum (l2p ++ l2pp) =
+      hd + sum l2p + sum l2pp = sum l2p + sum (Cons hd l2pp) = sum (l2p ++ Cons hd l2pp) = sum l2 };
+    assert { sum l1 = sum l2}
+  end
+
+  let rec lemma  mapSumMonotoneOnF (f: 'a -> int) (g : 'a -> int) (l : list 'a) =
+  variant {length l}
+  requires {forall a. num_occ a l > 0 -> f a >= g a }
+  ensures  {sum (map f l) >= sum (map g l)}
+  match l with
+    | Nil -> ()
+    | Cons _ l' ->
+      let _ = mapSumMonotoneOnF f g l' in ()
+  end
+
+  let rec lemma mapSumMonotoneOnFStrict (f : 'a -> int) (g : 'a -> int) (l : list 'a) (x : 'a) (delta : int) =
+  requires {forall a. num_occ a l > 0 -> f a >= g a}
+  requires {f x >= g x + delta }
+  requires {num_occ x l > 0}
+  variant  {l}
+  ensures  {sum (map f l) >= sum (map g l) + delta}
+  match l with
+   | Nil -> ()
+   | Cons h l' ->
+     assert {sum (map f l) = f h + sum (map f l')};
+     assert {sum (map g l) = g h + sum (map g l')};
+
+     if equal h x then (
+       let _ = mapSumMonotoneOnF f g l' in
+       assert {sum (map f l) >= sum (map g l)};
+       assert {f x >= g x + delta}
+     ) else (
+       let _ = mapSumMonotoneOnFStrict f g l' x delta in
+       assert {f x >= g x}
+     )
+   end
+
+  let lemma sumMapCons (f : 'a -> int) (l : list 'a) (x : 'a) =
+  ensures {sum (map f (Cons x l)) = f x + sum (map f l)}
+  ()
+
+  let lemma sumMapNil (f : 'a -> int) =
+  ensures {sum (map f Nil) = 0}
+  ()
+
+  let rec lemma removeOneSum (l : list int) (elem : int) =
+  requires { member elem l }
+  ensures  { sum l = sum (removeOne elem l) + elem }
+  variant {l}
+  let st = sum l = sum (removeOne elem l) + elem in
+  match l with
+    | Cons x xs -> if equal x elem then (
+                   assert { removeOne elem l = xs };
+                   assert { sum l = x + sum xs};
+                   assert {st})
+                   else (let _ = removeOneSum xs elem in assert {st})
+    | Nil -> absurd;
+  end
+
+  let rec lemma removeOneSumMap (f : 'a -> int) (l : list 'a) (elem : 'a) =
+  requires { member elem l }
+  ensures  { sum (map f l) = sum (map f (removeOne elem l)) + f elem }
+  variant {l}
+  let st = sum (map f l) = sum (map f (removeOne elem l)) + f elem in
+  match l with
+    | Cons x xs -> if equal x elem then (
+                   assert { removeOne elem l = xs };
+                   assert { sum (map f l) = f x + sum (map f xs)};
+                   assert {st})
+                   else (let _ = removeOneSumMap f xs elem in assert {st})
+    | Nil -> absurd;
+  end
+
+  let rec sumInclusionNonEq (l1 l2 : list int) =
+  variant {l2}
+  requires { forall x . member x l2 -> x >= 0}
+  requires { forall x . num_occ x l1 <= num_occ x l2 }
+  ensures { sum l1 <= sum l2 }
+  match l2 with
+    | Nil -> assert {l1 = Nil};
+    | Cons x xs ->
+        if num_occ_comp (=) x l1 > 0 then
+          ( let l1' = removeOne x l1 in
+            let _ = sumInclusionNonEq l1' xs in (*Precondition : apply Requires1*)
+            let _ = removeOneSum  l1 x in
+            assert { sum l1' + x = sum l1};
+            assert { sum l1 <= sum l2 } )
+        else
+          sumInclusionNonEq l1 xs (*Precondition : apply Requires1*)
+  end
+
+  let lemma sumMapStrictInclusionLeq (l1 l2 : list 'a) (f : 'a -> int) (elem : 'a) =
+  requires { forall x . member x l2 -> f x >= 0}
+  requires { forall x . num_occ x l1 <= num_occ x l2 }
+  requires { num_occ elem l1 < num_occ elem l2}
+  ensures { sum (map f l1) + f elem <= sum (map f l2)}
+    assert {member elem l2};
+    let l2r = removeOne elem l2 in
+    let l2s = Cons elem l2r in
+    assert {sum (map f l2s) = sum (map f l2)};
+    assert {sum (map f l2s) = f elem + sum (map f l2r)};
+    assert {forall x . num_occ x l1 <= num_occ x l2r};
+    sumInclusionNonEq (map  f l1) (map f l2r)
+
+  let rec lemma mapEq (f : 'a -> 'b) (g : 'a -> 'b) (l : list 'a) =
+  requires { forall x. num_occ x l > 0 -> f x = g x }
+  ensures { map f l = map g l }
+    match l with
+    | Nil -> ()
+    | Cons _ r -> mapEq f g r
+    end
+
+  predicate atMostOneElem (l : list 'a) = forall x y. num_occ x l > 0 -> num_occ y l > 0 -> x = y
+
+  let rec function checkOnlyOneElem_comp (compare: 'a -> 'a -> bool) (l : list 'a) =
+  requires { forall x y. compare x y <-> x = y }
+  requires { l <> Nil }
+  ensures { forall x. (result = Some x) -> num_occ x l > 0 }
+  ensures { isSome result <-> atMostOneElem l }
+  ensures { (result = None) <-> not atMostOneElem l } (* negation of second point *)
+  variant { l }
+    match l with
+    | Cons a Nil -> Some a
+    | Cons a (Cons b tl) ->
+      if compare a b then
+        let _ = assert { forall y. num_occ y (Cons b tl) > 0 -> num_occ y l > 0 } in
+        (*let _ = assert { onlyThisElem a l -> onlyThisElem a (Cons b tl) } in*)
+        checkOnlyOneElem_comp compare (Cons b tl)
+      else
+        let _ = assert { num_occ a l > 0 /\ num_occ b l > 0 /\ a <> b } in
+        None
+    | _ -> absurd
+    end
+
+  predicate singleton (p : 'a -> bool) =
+    forall x y. p x -> p y -> x = y
+
+  let rec function catMaybes (l : list (option 'a)) : list 'a =
+    match l with
+    | Nil -> Nil
+    | Cons None tail -> catMaybes tail
+    | Cons (Some a) tail -> Cons a (catMaybes tail)
+    end
+
+  let rec lemma catMaybesSpec (l : list (option 'a)) =
+  ensures {forall a. num_occ a (catMaybes l) = num_occ (Some a) l}
+    match l with
+    | Nil -> ()
+    | Cons None tail -> catMaybesSpec tail
+    | Cons (Some _) tail -> catMaybesSpec tail
+    end
+
+  lemma catMaybesContains : forall l : list (option 'a). forall x. num_occ x (catMaybes l) > 0 <-> num_occ (Some x) l > 0
+
+  let lemma catMaybesPreserveInclusion (l1 l2 : list (option 'a)) =
+  requires { includedList l1 l2 }
+  ensures { includedList (catMaybes l1) (catMaybes l2) }
+    ()
+
+  let lemma catMaybesPreservePerm (l1 l2 : list (option 'a')) =
+  requires {forall x . num_occ x l1 = num_occ x l2}
+  ensures  {forall x. num_occ x (catMaybes l1) = num_occ x (catMaybes l2)}
+  ()
+
+  let rec lemma catMaybesConcat (l1 l2 : list (option 'a)) =
+  ensures { catMaybes (l1 ++ l2) = catMaybes l1 ++ catMaybes l2 }
+    match l1 with
+    | Nil -> ()
+    | Cons hd tl ->
+      catMaybesConcat tl l2;
+      assert { l1++l2 = Cons hd (tl++l2)};
+      match hd with
+      | None -> ()
+      | Some hdp ->
+        assert { catMaybes (Cons (Some hdp) (tl ++ l2)) = Cons hdp (catMaybes (tl++l2)) }
+      end
+    end
+
+  let lemma catMaybesMapListEq (l1 l2 : list 'a) (f : 'a -> option 'b) =
+  requires {forall x. isSome (f x) -> (num_occ x l1 > 0) = (num_occ x l2 > 0)}
+  ensures {listEq (catMaybes (map f l1)) (catMaybes (map f l2))}
+  () (*split_vc; eliminate_definition; finisher *)
+
+  let lemma catMaybesMapListStrongEq (l1 l2 : list 'a) (f : 'a -> option 'b) =
+  requires {forall x. isSome (f x) -> (num_occ x l1 = num_occ x l2) }
+  ensures {listEq (catMaybes (map f l1)) (catMaybes (map f l2))}
+  () (*split_vc; eliminate_definition; finisher *)
+
+  let rec function minListAux (acc : int) (l : list int) =
+  ensures {result = acc \/ num_occ result l > 0}
+  ensures {forall x. num_occ x l > 0 -> x >= result}
+  ensures {result <= acc}
+    match l with
+    | Nil -> acc
+    | Cons x tail -> if (acc < x) then minListAux acc tail else minListAux x tail
+    end
+
+  let function minList (l : list int ) : int =
+  requires {length l > 0}
+  ensures {num_occ result l > 0}
+  ensures {forall x. num_occ x l > 0 -> x >= result}
+    match l with
+    | Nil -> absurd
+    | Cons x xs -> minListAux x xs
+    end
+
+  let lemma minListAuxOrderIndependent (acc : int) (l1 l2 : list int) =
+  requires { listEq l1 l2}
+  ensures  { minListAux acc l1 = minListAux acc l2}
+  ()
+
+  lemma minListAuxOrderIndependentLem : forall acc. forall l1 l2.  listEq l1 l2 -> minListAux acc l1 = minListAux acc l2
+
+  let lemma minListOrderIndependent (l1 l2 : list int) =
+  requires {length l1 > 0}
+  requires {listEq l1 l2}
+  ensures  { minList l1 = minList l2}
+  ()
+
+  let lemma minListPointwise (l1 l2 : list int) =
+  requires { length l1 = length l2 }
+  requires { forall i. 0 <= i < length l1 -> nth3 i l1 <= nth3 i l2  }
+  ensures { minList l1 <= minList l2 }
+    ()
+
+  let lemma mapFPointwise (f1 f2 : 'a -> int) (l : list 'a) =
+  requires { forall x. f1 x <= f2 x }
+  ensures { forall i. 0 <= i < length l -> nth3 i (map f1 l) <= nth3 i (map f2 l) }
+    ()
+
+  let function min (x y : int) : int = if x < y then x else y
+
+  let rec lemma minListAuxCatMaybesMap (acc1 acc2 : int)  (f1 : 'a -> option int) (f2 : 'a -> option int) (l : list 'a) =
+  requires {forall x. f1 x = None <-> f2 x = None}
+  requires {forall x y1 y2. f1 x = Some y1 /\ f2 x = Some y2 -> y1 <= y2}
+  requires {acc1 <= acc2}
+  ensures {minListAux acc1 (catMaybes (map f1 l)) <= minListAux acc2 (catMaybes (map f2 l))}
+  variant {length l}
+  match l with
+    | Nil -> ()
+    | Cons x xs ->
+      match (f1 x, f2 x) with
+      | (None, None) -> minListAuxCatMaybesMap acc1 acc2 f1 f2 xs
+      | (Some y1, Some y2) ->
+        assert {minListAux acc1 (catMaybes (map f1 l)) = minListAux (min y1 acc1) (catMaybes (map f1 xs))};
+        assert {f2 x = Some y2};
+        assert {l = Cons x xs};
+        assert {catMaybes (map f2 l) = Cons y2 (catMaybes (map f2 xs))};
+        assert {minListAux acc2 (catMaybes (map f2 l)) = minListAux (min y2 acc2) (catMaybes (map f2 xs))}; (*Rewrite Assert*)
+        minListAuxCatMaybesMap (min y1 acc1) (min y2 acc2) f1 f2 xs
+      | _ -> absurd
+      end
+  end
+
+  let rec function forallL (p : 'a -> bool) (l : list 'a) =
+  ensures {result <-> forall x . member x l -> p x}
+  match l with
+    | Nil -> True
+    | Cons x xs -> if p x then forallL p xs else False
+  end
+
+  let rec function existsL (p : 'a -> bool) (l : list 'a) =
+  ensures {result <-> exists x. member x l /\ p x}
+  match l with
+    | Nil -> False
+    | Cons x xs -> if p x then True else existsL p xs
+  end
+
+  let rec lemma mapNotPresent (f : 'a -> 'b) (l : list 'a) (x : 'a) =
+  requires { not (member (f x) (map f l)) }
+  ensures  { not member x l}
+  variant  { length l}
+  match l with
+    | Nil -> ()
+    | Cons y ys -> if equal x  y then absurd else mapNotPresent f ys x
+  end
+
+  predicate unique (l : list 'a) =
+    forall x. num_occ x l <= 1
+
+  let lemma uniqueTail (hd : 'a) (tl : list 'a) =
+  requires { unique (Cons hd tl) }
+  ensures { unique tl }
+    let lemma helper (x : 'a) =
+    ensures { num_occ x (Cons hd tl) >= num_occ x tl }
+      () in
+    ()
+
+  lemma uniqueFromTail : forall hd : 'a, tl : list 'a. unique tl -> num_occ hd tl = 0 -> unique (Cons hd tl)
+
+  let lemma uniqueHeadNotInTail (hd : 'a) (tl : list 'a) =
+  requires { unique (Cons hd tl) }
+  ensures { num_occ hd tl = 0 }
+   if num_occ hd tl = 0 then () else (
+   assert { num_occ hd tl > 0 };
+   assert { num_occ hd (Cons hd tl) = 1 + num_occ hd tl > 1 }
+  )
+
+  use list.Append
+  let lemma uniqueAppend (l1 l2 : list 'a) =
+  requires { unique l1 }
+  requires { unique l2 }
+  requires { forall x. num_occ x l1 > 0 -> num_occ x l2 = 0 }
+  ensures { unique (l1 ++ l2) }
+  ()
+
+  let rec lemma uniqueByOrder ( l : list 'a) =
+  variant { l}
+  requires { forall i j. 0 <= i < length l -> 0 <= j < length l -> nth3 i l = nth3 j l -> i = j}
+  ensures { unique l }
+    match l with
+    | Nil -> ()
+    | Cons hd tl ->
+      let lemma helper (i j : int) =
+      requires {  0 <= i < length tl }
+      requires {  0 <= j < length tl }
+      requires { nth3 i tl = nth3 j tl }
+      ensures { i = j}
+        assert { nth3 (i+1) l = nth3 i tl = nth3 j tl = nth3 (j+1) l };
+        assert { i+1 = j+1 }
+      in
+      uniqueByOrder tl;
+      if num_occ hd tl = 0 then
+        ()
+      else (
+        assert { exists i. 0 <= i < length tl /\ nth3 i tl = hd };
+        let ghost i = any int ensures { 0 <= result < length tl /\ nth3 result tl = hd } in
+        assert { nth3 (i+1) l = hd };
+        assert { nth3 0 l = hd };
+        absurd
+      )
+    end
+
+  let rec predicate checkUnique (compare: 'a -> 'a -> bool) (l : list 'a) =
+  requires { forall x y. compare x y <-> x = y }
+  ensures { result <-> unique l }
+    match l with
+    | Nil -> true
+    | Cons hd tl ->
+      assert { unique l -> num_occ hd tl = 0 };
+      num_occ_comp compare hd tl = 0 &&
+      checkUnique compare tl
+    end
+
+  predicate uniqueMap (b : list ('a, 'b)) =
+    (forall tx : 'a. forall t1 t2 : 'b. num_occ (tx, t1) b > 0 -> num_occ (tx, t2) b > 0 -> t1 = t2) /\
+    unique b
+  let lemma uniqueMapTail (hd : ('a, 'b)) (tl : list ('a, 'b)) =
+  requires { uniqueMap (Cons hd tl) }
+  ensures { uniqueMap tl }
+    let lemma helper (x : ('a, 'b)) =
+    ensures { num_occ x (Cons hd tl) >= num_occ x tl }
+      () in
+    ()
+
+  let lemma uniqueMapAppend (l1 l2 : list ('a, 'b)) =
+  requires { uniqueMap l1 }
+  requires { uniqueMap l2 }
+  requires { forall x. forall y. num_occ (x, y) l1 > 0 -> forall z. num_occ (x, z) l2 = 0 }
+  ensures { uniqueMap (l1 ++ l2) }
+    ()
+
+  let function findElem (p: 'a -> bool) (l : list 'a) : option 'a =
+  returns {
+    | None -> forall msg : 'a. p msg -> num_occ msg l = 0
+    | Some msg -> num_occ msg l > 0 /\ p msg
+  }
+    match find2 p l with
+    | None -> None
+    | Some i -> Some (nth3 i l)
+    end
+
+  let ghost function findElemMapHelper (x : 'a) (y : ('a, 'b)) : bool =
+    let (y1, _) = y in
+      equal y1 x
+
+  let ghost function findElemMap (x : 'a) (l : list ('a, 'b)) : option 'b =
+    match findElem (findElemMapHelper x) l with
+    | None -> None
+    | Some (_, y) -> Some y
+    end
+
+  let lemma findElemMapSpec (x : 'a) (l : list ('a, 'b)) =
+  ensures {
+    match findElemMap x l with
+    | None -> (forall  x1 y1. num_occ (x1,y1) l > 0 -> x1 <> x)
+    | Some y1 -> num_occ (x, y1) l > 0
+    end
+  }
+    match findElem (findElemMapHelper x) l with
+    | None ->
+      assert { findElemMap x l = None };
+      assert { forall  x1 y1. num_occ (x1,y1) l > 0 -> x1 <> x }
+    | Some (_, y) ->
+      assert { findElemMap x l = Some y };
+      assert { num_occ (x, y) l > 0 }
+    end
+
+  let function findElemMap_comp (compare: 'a -> 'a -> bool) (x : 'a) (l : list ('a, 'b)) : option 'b =
+  requires { forall x y. compare x y <-> x = y }
+  ensures { result = findElemMap x l }
+    let function f : ('a, 'b) -> bool = fun y ->
+      let (y1, _) = y in
+      compare y1 x
+    in
+    assert {
+      (forall y. f y = findElemMapHelper x y) &&
+      f = findElemMapHelper x &&
+      findElem f l = findElem (findElemMapHelper x) l }; (*Finisher*)
+    match findElem f l with
+    | None -> None
+    | Some (_, y) -> Some y
+    end
+
+  let function concreteAny (_ : list ('a , 'b)) : 'b =
+    any 'b
+
+  let ghost function liftElemMap (x : 'a) (l : list ('a, 'b))  : 'b =
+  ensures { (exists y. num_occ (x, y) l > 0) -> num_occ (x, result) l > 0 }
+    match findElemMap x l with
+    | None -> concreteAny l
+    | Some y -> y
+    end
+
+  let function liftElemMap_comp (compare: 'a -> 'a -> bool) (x : 'a) (l : list ('a, 'b))  : 'b =
+  requires { forall x y. compare x y <-> x = y }
+  ensures { result =  liftElemMap x l }
+    match findElemMap_comp compare x l with
+    | None -> concreteAny l
+    | Some y -> y
+    end
+
+  let lemma liftElemMapExtension (x : 'a) (l1 l2 : list ('a, 'b))  =
+  requires { uniqueMap l2 }
+  requires { includedList l1 l2 }
+  requires { exists y. num_occ (x, y) l1 > 0 }
+  ensures { liftElemMap x l1 = liftElemMap x l2 }
+    assert { num_occ (x, liftElemMap x l1) l1 > 0 };
+    assert { num_occ (x, liftElemMap x l1) l2 > 0 };
+    assert { num_occ (x, liftElemMap x l2) l2 > 0 };
+    assert { liftElemMap x l1 = liftElemMap x l2 }
+
+  let lemma liftAndFind (l : list ('a, 'b)) (x : 'a) =
+  requires { exists y. num_occ (x,y) l > 0}
+  requires { uniqueMap l }
+  ensures { findElemMap x l = Some (liftElemMap x l) }
+    match findElemMap x l with
+    | None -> absurd
+    | Some y ->
+      assert { num_occ (x, y) l > 0 };
+      assert { num_occ (x, liftElemMap x l) l > 0 };
+      assert { y = liftElemMap x l }
+    end
+
+  let function liftElemMap2 (compare: 'a -> 'a -> bool) (l : list ('a, 'b)) (x : 'a) : ('a, 'b) =
+    requires { forall x y. compare x y <-> x = y }
+    (x, liftElemMap_comp compare x l)
+
+  let rec lemma mapCompare (f : 'a -> 'b) (g : 'a -> 'b) (l : list 'a) =
+  requires { forall x. num_occ x l > 0 -> f x = g x }
+  ensures { map f l = map g l }
+    match l with
+    | Nil -> ()
+    | Cons _x r -> mapCompare f g r
+    end
+
+  let rec lemma sumZero (l : list 'a) =
+  ensures { sum (map (fun _ -> 0) l) = 0 }
+    match l with
+    | Nil -> ()
+    | Cons _hd tl -> sumZero tl
+    end
+
+  let rec lemma listSumPositive (l : list int) ( x : int) =
+    requires { forall x.  num_occ x l > 0 -> x >= 0}
+    requires { num_occ x l > 0 }
+    ensures { sum l >= x }
+    mapSumMonotoneOnFStrict (fun x -> x) (fun _ -> 0) l x x;
+    sumZero l;
+    mapId l
+
+  let function seq (n : int) : list int =
+  requires { n >= 0}
+  ensures { forall x. 0 <= x < n <-> num_occ x result = 1 }
+  ensures { forall x. not (0 <= x < n) <-> num_occ x result = 0 }
+  ensures { unique result }
+  ensures { length result = n }
+  ensures { forall i. 0<= i < n -> nth3 i result = i }
+    let rec looper (start : int) (len : int) =
+    requires { len >= 0 }
+    variant { len }
+    ensures { length result = len }
+    ensures { forall i. 0<= i < len -> nth3 i result = i+start }
+    ensures { forall i. start <= i < len + start -> num_occ i result = 1 }
+    if len = 0 then
+      Nil
+    else
+      Cons start (looper (start+1) (len-1))
+    in
+    looper 0 n
+  
+  let rec function maxListAux (acc : int) (l : list int) =
+  ensures {result = acc \/ num_occ result l > 0}
+  ensures {forall x. num_occ x l > 0 -> x <= result}
+  ensures {result >= acc}
+    match l with
+    | Nil -> acc
+    | Cons x tail -> if (acc > x) then maxListAux acc tail else maxListAux x tail
+    end
+  
+  let function freshInt (l : list int) : int =
+  ensures { not member result l }
+  (maxListAux 0 l) + 1
+
+  lemma infinitelyManyIds : forall l : list int. exists x : int. num_occ x l = 0
+  
+end (* ListLibrary *)

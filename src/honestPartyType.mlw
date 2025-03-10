@@ -1,0 +1,551 @@
+(* First part of lightning node implementation *)
+(* Meets the specification of partyInterface.mlw/AbstractPartySpec *)
+(* Remaining implementation in honestPartyInteraction.mlw *)
+
+(* Defined in this module:
+- Honest party type (keeping state of the node)
+- Honest party internal invariant `goodParty`
+- Honest party & signature functionality joint invariant `agreement`
+  Overall `partyInvariant`, combines two invariants described above. It is exposed in the interface.
+- 'view' function (`getSimpleParty`) - returns a `simplePartyT` as defined in the specification, abstracting away implementation details
+  
+  Remaining parts (implementation of `partyProcessMsg` and `initialPartyState`) are in file honestPartyInteraction.mlw.
+  Instantiation of partyInterface.mlw/AbstractPartySpec interface/specification happens in honestPartyInteraction.mlw/HonestPartyImplementationSpec
+*)
+
+
+module HonestPartyType
+  use basicTypes.BasicTypes
+  
+  use basicTypes.Util
+  use partyInterface.GoodSplitsAndRevocationsRecord
+  use signaturesFunctionality.SignaturesFunctionality
+
+  type signedMessagesListT = list (signableT, signatureT)
+
+  (* The set of states in which we are not committed to any channel - in the sense that we could stop interacting while in these states without losing money. *)
+  (* Some of those states are specific to the channel funder and some to the fundee -- the comments explain which ones.*)
+  type stateOpeningT =
+    | ChannelNotOpened
+    | OpenChannelSent amountT (* channel funding amount *) amountT (* account funds (i.e. `totalAmount`) *) idT (* id of source account *) (* funder only *)
+    | AcceptChannelSent amountT (* fundee only *)
+    | FundingCreatedSent transferFromPublicKeyAccountT halfSignedSplitT (* funder only *)
+    | ChannelOpenFailed
+
+  (* In most of the states of `stateCommittedT` we are committed to a particular channel. *)
+  (* In all of these states we have full information about the committed channel, including, e.g. `bestSplit`. *)
+  (* Two states are special: `CommitmentSignedSent` and `CommitmentSignedSentAndClosing`.
+     We enter `CommitmentSignedSent` near the end of the funding procedure. 
+     When in this state, we will commit to the channel as soon as we see the funding transaction on-chain.
+     All internal party invariants have already been established, therefore this state is part of `stateCommitted`.
+     Nevertheless, from the point of view of `partyInterface`, we are not yet committed to any channel. *)
+
+  type stateCommittedT =
+    (* === The following states are used  during the finalization of channel opening === *)
+    (* fundee moves to this state after sending `CommitmentSigned` - basicTypes.mlw *)
+    | CommitmentSignedSent
+    (* funder moves to this state after submitting the funding transaction on-chain *)
+    | WaitingForFundingTxInclusion (* funder only *)
+    (* funder moves to this state after sending `ChannelReadyByFunder` - basicTypes.mlw *)
+    | ChannelReadySentByFunder (* funder only *)
+
+    (* === The following are used states during normal channel operation === *)
+    | Standby
+    | Initiated (nonceT, amountT)                    (* payer *)
+    | InProgress (nonceT, amountT, halfSignedSplitT) (* payee *)
+    | DoneNotFinal (halfSignedSplitT, amountT)       (* payer *)
+
+    (* === The following states are used during channel closing === *)
+    (* The other party sent us an unexpected or malformed message and we have started a dispute on-chain *)
+    | ClosingDispute (ghost option splitT)
+    (* We have sent a message to revoke the disputed split on-chain and we are going to get all the money *)
+    | ClosingRevoke (ghost option splitT)
+    (* One of the two parties (the "conditional" party) submitted a commitment transaction on-chain and we do not have the revocation for the disputed split *)
+    (* We wait until the conditional party claims their money *)
+    | ClosingWaitingForTimeout (ghost option splitT)
+    (* The channelTimelock has passed and we have just sent a request to transfer the conditional amount to the conditional party *)
+    | ClosingTimeoutSent (ghost option splitT)
+    (* Fundee moves to this state if closing is initiated while in `CommitmentSignedSent` *)
+    | CommitmentSignedSentAndClosing
+
+  let predicate isCommitmentSignedSent (status : stateCommittedT) =
+    match status with
+    | CommitmentSignedSent
+    | CommitmentSignedSentAndClosing
+      -> true
+    | _ -> false
+    end
+
+  (* A party's balance in the channel comes in two flavors: *)
+  (* internal (`channelDataT.balanceOur`) and external (`channelDataT.balanceOurExt`). *)
+  (* The internal ones are the funds that are actually controlled by the protocol party, and *)
+  (* the external ones are those that the protocol party guarantees to the environment. *)
+  (* In particular, the external balance is always less than or equal to the internal balance.*)
+
+  (* To understand the difference better, imagine that our party implementation is run by an actual user.*)
+  (* When the user orders an on chain payment, the external balance is decreased immediately, *)
+  (* but the internal balance is only decreased when the implementation actually commits to the transaction. *)
+
+  (* A similar distinction will appear in the definition of `partyStateT` for the on-chain balance of the party, *)
+  (* where we define `partyStateT.balanceOnChain` and `partyStateT.balanceOnChainExt`. *)
+  (* An example situation where the two balances are not equal is when, during channel opening,*)
+  (* the funder reserves some on-chain coins for funding the channel, but does not spend them immediately.*)
+  (* However, it might be worth mentioning that the simple on-chain transfers never result in discrepancies between *)
+  (* the internal and external on-chain funds.*)
+  
+  
+
+  (*Type of the channel information, kept by the party when it is in one of stateCommittedT states *)
+  type channelDataT = {
+    balanceOurExt : amountT;
+    balanceOur : amountT;
+    balanceThey : amountT;
+    bestVersionOur : halfSignedSplitT; (* The most recent split that the other party has signed. This is the split that our implementation will use to open a dispute when it wants to close the channel. *)
+    bestVersionThey : halfSignedSplitT; (* The most recent split we have signed. The counterparty should use this version to open a dispute when it wants to close the channel. (Se also `getSecondBestVersionThey`) *)
+    innerState : stateCommittedT;
+  }
+
+  let function getFundingTx (x : channelDataT) : transferFromPublicKeyAccountT =
+    x.bestVersionOur.split.condOutput.id
+
+  (* The 'state-machine like' part of the state of the party - it contains both states from `stateOpeningT` and `stateCommittedT`.*)
+  (* The states from `stateCommittedT` are extended by the `channelDataT` record. *)
+  type stateT =
+  | BeforeCommitment stateOpeningT
+  | AfterCommitment channelDataT
+
+  let predicate isCommitmentSignedSentState (s : stateT) =
+    match s with
+    | BeforeCommitment _ -> false
+    | AfterCommitment channelData ->
+      isCommitmentSignedSent channelData.innerState
+    end
+
+  (* The complete state of the party *)
+  type partyStateT = {
+    partySide : partyT; (* Who we are -- A or B *)
+    ghost messagesSigned : signedMessagesListT; (* The messages we have signed *)
+    revocationSigs : revokedSplitsListT; (* received from counter-party on each payment *)
+    balanceOnChain : amountT;
+    balanceOnChainExt : amountT;
+    partyNonce : nonceT; (* Nonce counter used for on-chain messages *)
+    splitNonce : nonceT; (* Nonce counter used for off-chain messages*)
+    state : stateT;
+  }
+  
+  let function getBestVersionOur (p : partyStateT) : option halfSignedSplitT  =
+    match p.state with
+    | BeforeCommitment _stateOpening -> None
+    | AfterCommitment dataAboutChannel ->
+      Some dataAboutChannel.bestVersionOur
+    end
+  
+  (* When the counter-party has two non-revoked splits (this happens during a lightning transaction), *)
+  (* this function returns the one that is different from `bestVersionThey`. *)
+  let ghost function getSecondBestVersionThey (s : stateCommittedT) : option splitT =
+    match s with
+    | InProgress (_, _, half) -> Some half.split
+    | DoneNotFinal (half, _) -> Some half.split
+    | ClosingDispute x -> x
+    | ClosingRevoke x -> x
+    | ClosingWaitingForTimeout x -> x
+    | ClosingTimeoutSent x -> x
+    | _ -> None
+    end
+  
+  let ghost function isClosingDispute x =
+    match x with | ClosingDispute _ -> true | _ -> false end
+
+  let function isClosing x =
+    match x with | ClosingRevoke _ | ClosingWaitingForTimeout _ | ClosingTimeoutSent _ | ClosingDispute _ | CommitmentSignedSentAndClosing -> true | _ -> false end
+
+  let function isChannelOpenFailed x =
+    match x with | ChannelOpenFailed -> true | _ -> false end
+
+  let function isClosingState (x : stateT) =
+    match x with
+    | BeforeCommitment y -> isChannelOpenFailed y
+    | AfterCommitment y -> isClosing y.innerState
+    end
+  
+  (* When we are in the middle of receiving money form counterparty, return incoming amount *)
+  let ghost function incomingMoney (status : stateCommittedT) : amountT =
+    match status with
+    | InProgress (_, amount, _) -> amount
+    | _ -> 0
+    end
+
+  let ghost function moneyLockedForChannelPayment (status : stateCommittedT) : amountT =
+    match status with
+    | Initiated (_, amount) -> amount
+    | _ -> 0
+    end
+
+  let ghost function moneyLockedForChannelPaymentFull (p  : partyStateT) : amountT =
+    match p.state with
+    | BeforeCommitment _state -> 0
+    | AfterCommitment channelData -> moneyLockedForChannelPayment channelData.innerState
+    end
+
+  let function moneyLockedForChannelFunding (state : stateT) : amountT =
+    match state with
+    | BeforeCommitment (OpenChannelSent amount _ _) -> amount
+    | BeforeCommitment (FundingCreatedSent fundingTx _) -> fundingTx.amount
+    | _ -> 0
+    end
+  
+  (* Get the id of the channel tracked by a party *)
+  let function getId (s : stateT) =
+    match s with
+    | BeforeCommitment _ -> None
+    | AfterCommitment d ->
+      Some (getFundingTx d)
+    end
+  
+  (* ==== PARTY INVARIANTS ==== *)
+
+  predicate messageSignatureIn (l : signedMessagesListT) (msg : signableT) (sgn : signatureT) =
+    num_occ (msg, sgn) l > 0
+
+  predicate notSigned (l : signedMessagesListT) (msg : signableT) =
+    forall sgn. num_occ (msg, sgn) l = 0
+
+  predicate amountNotNegative (status : stateCommittedT) =
+    match status with
+    | Initiated (_, amount)
+    | InProgress (_, amount, _)
+    | DoneNotFinal (_, amount) -> amount >= 0
+    | _ -> true
+    end
+
+  predicate amountSane (status : stateCommittedT) (balanceMy balanceThey : amountT) =
+    match status with
+    | Initiated (_, amount) -> amount <= balanceMy
+    | InProgress (_, amount, _) -> amount <= balanceThey
+    | _ -> true
+    end
+
+
+  (*A strengthened version of `signedSplitsSpecExt` (from partyInterface), which expresses the intuition that we have not signed incorrect splits*)
+  (*This version is stronger as:
+    1) It requires each unrevoked split, signed by us to be either equal to `bestVersionThey` or to `secondBestVersionThey`).
+    2) In the last case it requires us to be in one of the  'angry' states *)
+  (* This strengthening makes it possible to preserve the invariant during an in-channel payment:*)
+  (* when we receive a revocation for `bestVersionThey` we can simply forget that split and increase balanceOur.*)
+  predicate signedSplitsSpec (dataAboutChannel: channelDataT) (keysForRevoke : revokedSplitsListT) (s: splitT) =
+    s = dataAboutChannel.bestVersionThey.split \/
+    (getSecondBestVersionThey dataAboutChannel.innerState) = Some s \/
+    isSome (findSplitRevocation s.condOutput keysForRevoke) \/
+    (s = dataAboutChannel.bestVersionOur.split /\ isClosing dataAboutChannel.innerState)
+
+  (*all splits that we have signed satisfy `signedSplitsSpec`.*)
+  predicate signedSplitsSpecForSignedSplits (dataAboutChannel: channelDataT)
+                                           (keysForRevoke : revokedSplitsListT) (messagesSigned : signedMessagesListT) =
+    (forall msg sig. messageSignatureIn messagesSigned (SignableSplit msg) sig ->
+        signedSplitsSpec dataAboutChannel keysForRevoke msg)
+
+  (*Observe that from `signedSplitSpec` it follows that we only sign `bestVersionOur` when we are angry. 
+    Since we never update `bestVersionOur` in an angry state, this lets us assume that whenever we update `bestVersionOur` we 
+    have not signed the previous version of `bestVersionOur`.*)
+
+  predicate hasPositiveAmount (stateOpening: stateOpeningT) =
+    match stateOpening with
+    | OpenChannelSent amount _ _ | AcceptChannelSent amount -> amount >= 0
+    | _ -> true
+    end
+
+  predicate openChannelSentCorrect (stateOpening: stateOpeningT) =
+    match stateOpening with
+    | OpenChannelSent amount totalAmount _ -> amount <= totalAmount
+    | _ -> true
+    end
+
+  (*
+    When in `FundingCreatedSent`, we generate a `fundingTx` and we have to remember that it is correct.
+    Normally it is a job of the invariant of a committed state, but since at this point we are not committed yet,
+    we need to use the following temporary invariant instead.
+  *)
+  predicate fundingCreatedSentIsValid (stateOpening: stateOpeningT) (partyNonce: nonceT) (p : partyT) (messagesSigned : signedMessagesListT) =
+    match stateOpening with
+    | FundingCreatedSent fundingTx fundeesHalfSignedSplit -> (
+        fundingTx.sender = p /\
+        fundingTx.amount = fundeesHalfSignedSplit.split.amountUnCond /\
+        fundeesHalfSignedSplit.split.condOutput.amountCond = 0 /\
+        fundingTx.amount >= 0 /\
+        fundingTx.totalAmount >= fundingTx.amount /\
+        fundingTx.destination = Channel /\
+        num_occ (SignableSplit fundeesHalfSignedSplit.split, fundeesHalfSignedSplit.sigUnCond) messagesSigned > 0 /\
+        fundeesHalfSignedSplit.split.condOutput.partyCond = other p /\
+        fundeesHalfSignedSplit.split.condOutput.id = fundingTx /\
+        fundeesHalfSignedSplit.split.condOutput.nonce <= partyNonce /\
+        true
+      )
+    | _ -> true
+    end
+
+  (* This invariant states what splits is a party allowed to sign in the cannel-opening phase. *)
+  (* In the initial states (`ChannelNotOpened`, `OpenChannelSent`, `AcceptChannelSent`) the party should not have signed any splits. *)
+  (* In `FundingCreatedSent`, the party should have signed `fundeesHalfSignedSplit.split` and its should be kept in fundeesHalfSignedSplit.sigUnCond.*)
+  predicate onlyCorrectSplitsSignedInitially (stateOpening: stateOpeningT) (messagesSigned: signedMessagesListT) =
+    match stateOpening with
+    | ChannelNotOpened | OpenChannelSent _  _ _| AcceptChannelSent _ ->
+      forall msg sig. not messageSignatureIn messagesSigned (SignableSplit msg) sig
+    | FundingCreatedSent _fundingTx fundeesHalfSignedSplit ->
+      (forall msg sig. messageSignatureIn messagesSigned (SignableSplit msg) sig ->
+        (msg = fundeesHalfSignedSplit.split /\ sig = fundeesHalfSignedSplit.sigUnCond)
+      )
+    | _ -> true
+    end
+
+  predicate noRevokesSigned (signedMsgs: signedMessagesListT) =
+    forall split sig. num_occ (SignableRevoke split, sig) signedMsgs = 0
+
+  (* Main invariant of `channelDataT` *)
+  predicate goodChannelData (d : channelDataT) (p : partyT) =
+    d.balanceOur >= 0 /\
+    d.balanceThey >= 0 /\
+    d.balanceOurExt >= 0 /\
+    (d.balanceOur - d.balanceOurExt = moneyLockedForChannelPayment d.innerState \/ isClosing d.innerState) /\
+    d.balanceOur >=  d.balanceOurExt /\
+
+    d.bestVersionOur.split.amountUnCond = d.balanceThey /\
+    d.bestVersionOur.split.condOutput.amountCond = d.balanceOur /\
+    d.bestVersionOur.split.condOutput.partyCond = p /\
+    d.bestVersionOur.split.condOutput.id.destination = Channel /\
+    d.bestVersionOur.split.condOutput.id.totalAmount >= 0 /\ 
+
+    d.bestVersionThey.split.amountUnCond >= d.balanceOur /\
+    d.bestVersionThey.split.condOutput.partyCond = other p /\
+    (forall secondBestVersion. getSecondBestVersionThey d.innerState = Some secondBestVersion -> (
+      secondBestVersion.condOutput.partyCond = other p /\
+      secondBestVersion.amountUnCond >= incomingMoney d.innerState + d.balanceOur
+    )) /\
+    amountNotNegative d.innerState /\
+    amountSane d.innerState d.balanceOur d.balanceThey
+    (*What might seem surprising is that we do not require that `bestVersionThey.split.channelId = bestVersionOur.channelId`.
+      This is because it is in the other party's interest to keep the correct channel id -- otherwise the other invariants 
+      guaranteed that the other party cannot claim any funds from the channel.*)
+
+
+  predicate signableTXOnlyAboutOurChannelInner (p : partyT) (messagesSigned : list (signableT, signatureT)) (state : stateT) =
+    (forall args sig. args.sender=p -> num_occ (SignableTX args, sig) messagesSigned > 0 -> args.destination = Channel -> (
+      getId state = Some args /\
+      not isCommitmentSignedSentState state
+    ))
+
+  predicate signableTXOnlyAboutOurChannel (p : partyStateT) =
+    signableTXOnlyAboutOurChannelInner p.partySide p.messagesSigned p.state
+
+  (* The complete local (i.e. independent from `signatureFunctionalityT`) invariant of `partyStateT`*)
+  predicate goodParty (p : partyStateT) =
+    signableTXOnlyAboutOurChannel p (* pay-nonce *) /\ 
+
+    p.balanceOnChain = p.balanceOnChainExt + moneyLockedForChannelFunding p.state /\
+    p.balanceOnChainExt >= 0 /\
+
+    (* in all our stored revocations, the other party is the conditional one *)
+    (forall split, sig. num_occ (sig, split) p.revocationSigs > 0 -> split.partyCond = other p.partySide ) /\
+
+    (* we never sign a split, where we are Cond, and we revoked it *)
+      (forall split sig. split.condOutput.partyCond = p.partySide -> num_occ (SignableSplit split, sig) p.messagesSigned > 0  ->
+         (forall sig2. num_occ (SignableRevoke split.condOutput, sig2) p.messagesSigned = 0)) /\
+
+    (* our signed revocations are about smaller inner key then our bestVersionMy. We only signed revocations of correct side *)
+    (forall split sig. num_occ (SignableRevoke split, sig) p.messagesSigned > 0 -> (split.nonce < p.splitNonce /\ split.partyCond = p.partySide)) /\
+
+    (* the next part of the invariant depends on whether we are before or after the commitment: *)
+    match p.state with
+    | BeforeCommitment stateOpening ->
+     hasPositiveAmount stateOpening /\
+     fundingCreatedSentIsValid stateOpening p.partyNonce p.partySide p.messagesSigned /\
+     onlyCorrectSplitsSignedInitially stateOpening p.messagesSigned /\
+     openChannelSentCorrect stateOpening /\
+     noRevokesSigned p.messagesSigned
+    | AfterCommitment d ->
+      goodChannelData d p.partySide /\
+      (*  bestVersionOur has split exactly splitNonce, so it was not Revoked (and splits signed in future were not revoked) *)
+      d.bestVersionOur.split.condOutput.nonce = p.splitNonce /\
+      (* splits signed by us are either revoked or bestThey or secondBestThey or we are angry and in bestVersionOur (our closing msg) *)
+      (* signedSplitsSpecForSignedSplits d p.revocationSigs p.messagesSigned *)
+      (forall msg sig. messageSignatureIn p.messagesSigned (SignableSplit msg) sig ->
+        signedSplitsSpec d p.revocationSigs msg)
+    end
+
+  predicate preservedParty (x y : partyStateT) =
+    x.partySide = y.partySide
+
+  (* Next, we define agreement between the party and the signature functionality*)
+  (* Since we already keep some local records about the messages we have signed, and the signatures we have verified, *)
+  (* we simply need to make sure that these records are consistent with the signature functionality. *)
+
+  (*This predicate states that we correctly keep track of the messages we have signed.*)
+  predicate coherentOurSignatures (s : signatureFunctionalityT) (p : partyT) (l : list (signableT, signatureT)) =
+    (forall msg sig. num_occ (msg, sig) l <= num_occ (p, msg, sig) s.storage) /\
+    (forall msg. (exists sig. num_occ (p, msg, sig) s.storage > 0) <-> (exists sig. num_occ (msg, sig) l > 0))
+  
+  (*This predicate states that the counterparty signatures that we store, are correct.*)
+  predicate coherentCounterpartySignatures (s : signatureFunctionalityT) (p : partyStateT) =
+    (* Our best message is correctly signed by the counterparty. *)
+    (forall our. getBestVersionOur p = Some our ->
+      num_occ ((other p.partySide), SignableSplit our.split, our.sigUnCond) s.storage > 0) /\
+    (* The revocations we have received from the other party have correct signatures. *)
+    (forall sig split. num_occ (sig, split) p.revocationSigs > 0 ->
+      num_occ ((other p.partySide), SignableRevoke split, sig) s.storage > 0)
+
+  (*The complete agreement between party and signature functionality *)
+  predicate agreement (s : signatureFunctionalityT) (p : partyStateT) =
+    coherentOurSignatures s p.partySide p.messagesSigned /\
+    coherentCounterpartySignatures s p
+  
+  (*final party invariant, as prescribed in partyInterface *)
+  predicate partyInvariant (p : partyStateT) (sigState : signatureFunctionalityT) =
+    goodParty p /\
+    agreement sigState p
+
+
+  (* DEFINITION OF `getSimpleParty` *)
+
+  (* Next, we show how to extract a `simplePartyT` from the `partyStateT`. *)
+
+  let function getBestVersionOurWhenCommited (p : partyStateT) : option halfSignedSplitT  =
+    match p.state with
+    | BeforeCommitment _stateOpening -> None
+    | AfterCommitment dataAboutChannel ->
+      if isCommitmentSignedSent dataAboutChannel.innerState then
+        None
+      else Some dataAboutChannel.bestVersionOur
+    end
+
+  let function getSplitsAndRevocationsRecord (p : partyStateT) : partySplitsAndRevocationsRecordGeneralT =
+      {
+      recordOwnerG = p.partySide;
+      bestSplitReceivedG = getBestVersionOurWhenCommited p;
+      receivedRevocationsG  = p.revocationSigs;
+      }
+
+  use partyInterface.SimplePartyTypes
+ 
+  let function getChannelBalanceExt (p : partyStateT) : amountT =
+    match p.state with
+    | BeforeCommitment _ -> 0
+    | AfterCommitment dataAboutChannel ->
+      if isCommitmentSignedSent dataAboutChannel.innerState then
+        0 (*not committed to channel in external view yet *)
+      else
+        dataAboutChannel.balanceOurExt
+    end
+
+  (*The complete function that transforms a full party to simple party *)
+  let function getSimpleParty (p : partyStateT) : simplePartyT =
+    { channelInfo = p.getSplitsAndRevocationsRecord;
+      onChainBalance = p.balanceOnChain;
+      channelBalanceExt = p.getChannelBalanceExt ;
+      closingChannel = isClosingState p.state;
+    }
+
+end (* module HonestPartyType *)
+
+module HonestPartyLemmasAndProofs
+  use basicTypes.BasicTypes
+  
+  use listLibrary.ListLibrary
+  use partyInterface.SimplePartyTypes
+  use partyInterface.GoodSplitsAndRevocationsRecord
+  use signaturesFunctionality.SignaturesFunctionality
+  use HonestPartyType
+  
+  
+  let lemma correctRevokesWithSigState (p : partyStateT) (sigState : signatureFunctionalityT) (split : conditionalOutputT) (sig : signatureT) =
+  requires {goodParty p }
+  requires { agreement sigState p}
+  requires {  verify p.partySide (SignableRevoke split) sig sigState}
+  ensures { split.nonce < p.splitNonce /\ split.partyCond = p.partySide }
+    assert { exists sig2. num_occ (SignableRevoke split, sig2) p.messagesSigned > 0 }
+  
+  (* Lemmas about `getSimpleParty` and simple consequences of `goodParty` *)
+  let lemma externalBalanceCorrectionPositive (p : partyStateT) =
+    requires {goodParty p }
+    ensures { moneyLockedForChannelPaymentFull p >= 0 }
+    ensures { moneyLockedForChannelFunding p.state >= 0 }
+    match p.state with
+    | BeforeCommitment state  ->
+      match state with
+      | OpenChannelSent amount _ _ -> assert { amount >= 0} (*crushHeavy*)
+      | FundingCreatedSent fundingTx _hsSplit ->
+        assert { fundingTx.amount >= 0 } (*crushHeavy*)
+      | _ -> assert { moneyLockedForChannelFunding p.state = 0 }
+      end
+    | AfterCommitment dataAboutChannel ->
+      assert { goodChannelData dataAboutChannel p.partySide};
+      assert { amountNotNegative dataAboutChannel.innerState };
+      match dataAboutChannel.innerState with
+      | Initiated _ -> ()
+      | _ -> ()
+      end
+    end
+
+  let lemma positiveSecondOptionCorrection (channelData : channelDataT) (p : partyT) =
+  requires { goodChannelData channelData p }
+  ensures { incomingMoney channelData.innerState >= 0 }
+    let st = incomingMoney channelData.innerState >= 0 in
+    match channelData.innerState with
+    | InProgress _ -> assert {st}; (*crushHeavy*)
+    | _ -> assert {st};
+    end
+
+  let lemma channelDataHasSaneAmounts (channelData : channelDataT) (p : partyT) =
+  requires { goodChannelData channelData p }
+  ensures { hasSaneAmounts channelData.bestVersionOur.split }
+  ()
+
+  (*An auxiliary lemma for `goodSimplePartySpec` -- contains the crux of the proof. *)
+  let lemma goodView (p : partyStateT) (sigState : signatureFunctionalityT) =
+  requires { goodParty p }
+  requires { agreement sigState p}
+  ensures { goodSplitsAndRevocationsRecordOption p.getSplitsAndRevocationsRecord.makeStrict sigState }
+  ensures { partyKeepTrackOfSignedTxOpeningChannel p.getSplitsAndRevocationsRecord sigState }
+    match p.state with
+    | BeforeCommitment _ -> assert {p.getSplitsAndRevocationsRecord.makeStrict = None }
+    | AfterCommitment channelData ->
+      match p.getSplitsAndRevocationsRecord.makeStrict with
+      | None ->
+        assert {p.getSplitsAndRevocationsRecord.makeStrict = None };
+        assert { isCommitmentSignedSentState p.state };
+      | Some x ->
+        let st = goodSplitsAndRevocationsRecord x sigState in
+        let bestHs =  x.bestSplitReceived in
+        assert { bestHs = channelData.bestVersionOur };
+        assert { channelData.balanceOur = bestHs.split.condOutput.amountCond };
+        assert { goodChannelData channelData p.partySide };
+        let lemma helper (msg : splitT) (sig : signatureT) =
+        requires { verify (x.recordOwner) (SignableSplit msg) sig sigState }
+        ensures { signedSplitsSpecExt x.recordOwner x.receivedRevocations msg bestHs.split.condOutput.amountCond sigState }
+          let st2 = signedSplitsSpecExt x.recordOwner x.receivedRevocations msg bestHs.split.condOutput.amountCond sigState in
+          assert { verify  p.partySide  (SignableSplit msg) sig sigState };
+          let _sigFromList = any signatureT ensures { messageSignatureIn p.messagesSigned (SignableSplit msg) result } in (*unfold messageSignatureIn *)
+          assert { signedSplitsSpec channelData p.revocationSigs msg };
+          assert { msg = channelData.bestVersionOur.split -> (forall sig. not verify (x.recordOwner) (SignableRevoke (msg.condOutput)) sig sigState) }; (*finisher*)
+          match channelData.innerState.getSecondBestVersionThey with
+          | None -> assert { st2}
+          | Some _ -> (
+            assert {incomingMoney channelData.innerState >= 0};
+            assert {st2};
+          )
+          end
+        in assert { st}
+      end
+    end
+  
+
+  use partyInterface.GoodTransition
+  (*An important lemma, which states that the internal party invariant (`goodParty`) implies the public invariant (`goodSimpleParty`) required by the interface. *)
+  let lemma getSimplePartySpec (p : partyStateT) (sigState : signatureFunctionalityT) =
+  requires {goodParty p }
+  requires { agreement sigState p}
+  ensures { goodSimpleParty p.getSimpleParty sigState  }
+    match p.state with
+    | BeforeCommitment _ -> assert { goodSimpleParty p.getSimpleParty sigState }
+    | AfterCommitment _ -> assert { goodSimpleParty p.getSimpleParty sigState }
+    end
+
+end (* module HonestPartyLemmasAndProofs*)

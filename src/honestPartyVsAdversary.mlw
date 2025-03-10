@@ -1,0 +1,2892 @@
+(* In this file we connect all the pieces together, and prove the main security result: 
+an honest party that participates in a channel and sends/receives a number of payments 
+is able to unilaterally close the channel and recover all its rightful funds on-chain. 
+This file consists of the following modules:
+1) `HonestPartyVsAdversary`
+    This is the main module where we implement the security experiment,
+    as defined in Section 2 of the paper. In particular, we define 
+    system state, adversary moves, and the adversary's winning condition. 
+    The most important predicate is `honestPartyWins` which states that the honest party
+    can always extract all of its funds no matter how the adversary behaves.
+    All other modules in this file are dedicated to proving that this predicate holds.
+2) `ClosingWorksLemmas`
+    In this module we define an auxiliary lemma, `closingWorks`, which states that the honest party
+    can close the channel in a timely manner. 
+    More precisely, we show that if the honest party has been ordered to close the channel,
+    it can move all its funds from the channel to its on-chain account in no more than `channelClosingTime`.
+    This module follows the "Statement-Proof Separation" convention, explained in detail at the beginning of the `ClosingWorksLemmas` module.
+3) `ProtocolSecureLemmas`
+    In this module we define the main lemma which states that the protocol is secure, i.e. that `honestPartyWins` holds.
+    This is a very simple module that includes HonestPartyVsAdversary and simply asserts that the `honestPartyWins` predicate is true.
+    This module follows the "Statement-Proof Separation" convention, explained in detail at the beginning of the `ClosingWorksLemmas` module.
+4) `ClosingWorkProofs`
+    In this module we provide the proof of the lemma defined in `ClosingWorksLemmas`. 
+    The proof is based on the `closingInvariantFull`, which defines different phases of the channel-closing process
+    and ensures that the party moves through them in a timely manner. 
+    The proof is split into two parts, the first one is showing that the invariant is preserved during adversary moves,
+    and the second one is showing that the invariant together with the assertion that at least `channelClosingTime` has passed
+    since the party has been ordered to close the channel implies that all honestParty's funds are on-chain. 
+    Since this proof is mainly standalone (it does not use many lemmas from other modules), it is quite long. 
+5) `ProtocolSecureProof` 
+    In this module we provide the proof of the lemma defined in `ProtocolSecureLemmas` (i.e. we show that `honestPartyWins` holds).
+    The main idea of the proof is to use the evaluator preservation lemmas from gamma.mlw. The proof is again based on an invariant, 
+    called `systemStateInvariant`, whose main purpose is to ensure that the evaluator function (i.e. `partyExpectationsFull` from gamma.mlw)
+    never drops below the amount that the honest party should be able to recover (according to the experiment).
+    The proof again consists of two parts: The first one is showing that the invariant is preserved during adversary moves
+    and the second one is showing that the invariant implies that
+    the honest party always wins. The invariant preservation follows mostly from the evaluator preservation lemmas,
+    while the second part of the proof follows from the `closingWorks` lemma from the module `ClosingWorksLemmas`.
+    The argument is more involved than the one for the `ClosingWorkProofs`, 
+    but since it uses the theory developed in the previous modules, it is much shorter.
+*)
+
+
+module HonestPartyVsAdversary
+
+(* As mentioned in the introduction this module implements the security experiment, 
+explained in the Section~2 of the paper. We recommend reading the paper before going through this module
+*)
+
+use basicTypes.BasicTypes
+
+use listLibrary.ListLibrary
+use basicTypes.BasicLemmasAndProofs
+use basicTypes.Compare
+use signaturesFunctionality.SignaturesFunctionality
+
+
+use gamma.Evaluator
+use gamma.GammaInvariant
+use gamma.GammaInvariantLemmas
+use gamma.EvaluatorBasicLemmas
+use partyInterface.AbstractPartySpec
+use partyInterface.SimplePartyTypes
+use partyInterface.SimplePartyTypes
+
+(* === Experiment setup === *)
+
+(* The time that the honest party requires to close the channel, after being requested to do so. *)
+
+(* We start by picking the id of the honest party A or B. *)
+let constant honestPartySide : partyT = any partyT
+
+(* The other side is the adversary. *)
+let constant adversarySide : partyT = other honestPartySide
+
+(* The time that the honest party requires to close the channel, after being requested to do so. *)
+let constant channelClosingTime : timeT = 3*deltaNet + 2*deltaWake + channelTimelock + 1
+
+type systemStateT= {
+    gamma : gammaStateT; (* State of the blockchain. *)
+    honestParty : partyStateT; (* State of the honest party. *)
+    systemSignatureState : signatureFunctionalityT; (* State of signature functionality. *)
+    time : timeT; (* Current time *)
+    honestPartyLastWoken : timeT; (* When was the honest party last woken. We store this value to guarantee that the honest party is woken frequently enough (as defined by `deltaWake`. *)
+    msgsToGamma : list (msgToGammaT, timeT); (* A queue of messages to gamma (sent by the honest party). *)
+    expectedAmount : amountT; (* Honest party funds tracked by the environment. This is the amount that the party should be able to recover (in order not to lose the experiment) *)
+    closeOrderTime : option timeT (* When the honest party was ordered to close the channel, or None if no such order was given yet. *)
+    }
+
+(* A very simple invariant, that we need to prove that the precondition for `partyProcessMsg` holds.
+Later in the modules `ClosingWorkProofs` and `ProtocolSecureProof` we are going to use more complex and specific invariants, 
+to prove the required properties of the experiment. *)
+predicate systemStateInvariantSimple (s : systemStateT) = 
+    gammaCoherent s.gamma /\
+    partyInvariant s.honestParty s.systemSignatureState /\
+    s.honestParty.getSimpleParty.simplePartySide = honestPartySide /\
+    s.honestPartyLastWoken <= s.time
+    
+(* All possible moves of the adversary. *)
+type adversaryMoveT = 
+    | IncrementTime 
+    | SendMsgToParty partyInputT
+    | SendMsgToGamma msgToGammaT
+    | TransferFromVoid amountT partyT idT (* Create a new public key account on gamma for `partyT` -- this represents a transfer from the untracked part of the blockchain. *) 
+    | SignMsg signatureFunctionalityT
+    | DeliverMsgToGamma (msgToGammaT, timeT) (idT, idT) (* In the experiment, it is the adversary who controls the message queue,
+    so it is his job to deliver them. However he is required to deliver them on time (in any order)
+    and he has to provide fresh `idT`s for each message. *)                                 
+    | Pass (* Do nothing *)
+
+(* The time guarantees that the adversary needs to preserve. *)
+predicate timeGuarantee (s : systemStateT) = 
+    s.time <= s.honestPartyLastWoken + deltaWake /\
+    forall m t. member (m, t) s.msgsToGamma -> t + deltaNet >= s.time
+    
+(*Checks if the adversary is allowed to make a certain move, 
+  e.g. the adversary cannot increase time, if it were to break the time guarantee. *)
+predicate moveApplicable (system : systemStateT) (adversaryMove : adversaryMoveT) =
+  match adversaryMove with 
+  | IncrementTime -> timeGuarantee {system with time = system.time + 1}
+  | DeliverMsgToGamma msg (id1, id2) ->
+    num_occ msg system.msgsToGamma <> 0 /\
+    id1 <> id2 /\
+    idFreshForGamma system.gamma id1 /\
+    idFreshForGamma system.gamma id2
+  | TransferFromVoid amount _ _ -> amount >= 0
+  | SignMsg newSigsState -> signatureFunctionalityTransition honestPartySide system.systemSignatureState newSigsState
+  | _ -> true
+  end
+
+(* A simple function that computes the subset of the experiment available to the honest party *)
+let function getSystemView (s : systemStateT) : partySystemView =
+    {sigState = s.systemSignatureState; 
+     gammaState = s.gamma; 
+     currentTime = s.time; 
+     lastWoken = s.honestPartyLastWoken; 
+    }
+
+(* A function which shows how the system changes when the honest party processes a message. Used later in the `applyAdversaryMove` function. *)
+let function systemPartyProcessMsg (system : systemStateT) (msg : partyInputT) : systemStateT=
+requires {systemStateInvariantSimple system}
+    let p = system.honestParty in
+    let (newParty, updateRec) = partyProcessMsg p msg system.getSystemView in
+    let newSigState = updateRec.newSigState in
+    let newMsgs = updateMsgs system.time system.msgsToGamma updateRec in
+    let newExpectedAmount = system.expectedAmount + updateRec.moneyReceivedInChannel - msg.allowedTotalLoss in 
+    let closeNow = newParty.getSimpleParty.closingChannel || msg.isCloseOrder in 
+    let newChannelCloseOrderTime = if closeNow && not (isSome system.closeOrderTime) then Some system.time else system.closeOrderTime in
+    {system with honestParty = newParty; 
+                 systemSignatureState = newSigState; 
+                 msgsToGamma = newMsgs; 
+                 expectedAmount = newExpectedAmount; 
+                 closeOrderTime = newChannelCloseOrderTime;
+                 honestPartyLastWoken = system.time }
+
+(* A function which shows how to apply each move of the adversary. *)
+let function applyAdversaryMove (system : systemStateT) (adversaryMove : adversaryMoveT) : systemStateT=
+requires {systemStateInvariantSimple system}
+ensures {result =
+    match adversaryMove with 
+    | IncrementTime -> {system with time = system.time + 1}
+    | SendMsgToParty msg -> systemPartyProcessMsg system msg 
+    | DeliverMsgToGamma msg (id1, id2) ->
+      if num_occ_comp compareMsgQueueEntries msg system.msgsToGamma = 0 then system else 
+      let newMsgs = removeOne_comp compareMsgQueueEntries msg system.msgsToGamma in
+      let msgNewIds = replaceIdsInMsg msg.fst id1 id2 in
+      match gammaProcessMsg system.gamma msgNewIds system.systemSignatureState system.time with 
+        | AdversaryError -> system
+        | CorrectGamma g -> {system with gamma = g; msgsToGamma = newMsgs}
+      end 
+    | SendMsgToGamma msg -> 
+        match gammaProcessMsg system.gamma msg system.systemSignatureState system.time with
+            | AdversaryError -> system 
+            | CorrectGamma newGamma ->  {system with gamma = newGamma}
+        end
+    | SignMsg newSigsState ->
+        {system with systemSignatureState = newSigsState}
+    | TransferFromVoid amount p id -> {system with gamma = addMoneyFromVoid system.gamma id amount p system.time}
+    | Pass -> system
+    end}
+    match adversaryMove with 
+    | IncrementTime -> {system with time = system.time + 1}
+    | SendMsgToParty msg -> systemPartyProcessMsg system msg 
+    | DeliverMsgToGamma msg (id1, id2) ->
+      if num_occ_comp compareMsgQueueEntries msg system.msgsToGamma = 0 then system else 
+      let newMsgs = removeOne_comp compareMsgQueueEntries msg system.msgsToGamma in
+      let msgNewIds = replaceIdsInMsg msg.fst id1 id2 in
+      match gammaProcessMsg system.gamma msgNewIds system.systemSignatureState system.time with 
+        | AdversaryError -> system
+        | CorrectGamma g -> {system with gamma = g; msgsToGamma = newMsgs}
+      end 
+    | SendMsgToGamma msg -> 
+        match gammaProcessMsg system.gamma msg system.systemSignatureState system.time with
+            | AdversaryError -> system 
+            | CorrectGamma newGamma ->  {system with gamma = newGamma}
+        end
+    | SignMsg newSigsState ->
+        {system with systemSignatureState = newSigsState}
+    | TransferFromVoid amount p id -> {system with gamma = addMoneyFromVoid system.gamma id amount p system.time}
+    | Pass -> system
+    end
+
+(* === Reachable states === *)
+
+(*In order to define the winning condition we want to define which states are reachable. 
+We define a state as reachable if there is an initial state and a sequence of adversary moves that lead to this state*)
+
+(* First, we define all possible initial states. An initial state is parametrized by the initial gamma state. *)
+(* However, since we assume that the initial time is 0, we want to make sure that all transaction on gamma happened before that*)
+
+predicate gammaTimeCoherent (gamma : gammaStateT) (t : timeT) = 
+    forall ch . member ch gamma.activeContracts -> ch.lastContractTransitionTime <= t
+
+let function initialSystemState (gamma : gammaStateT) = 
+requires {gammaCoherent gamma}
+requires {gammaTimeCoherent gamma 0}
+    {gamma = gamma; 
+     honestParty = initialPartyState honestPartySide (immediateAmountOnChain gamma honestPartySide); 
+     systemSignatureState = emptySignatureState; 
+     time = 0; 
+     honestPartyLastWoken = 0; 
+     msgsToGamma = Nil; 
+     expectedAmount = immediateAmountOnChain gamma honestPartySide; 
+     closeOrderTime = None}
+
+(*Next, we want to show how to apply a sequence of adversary moves to a system state *)
+(*However, in order to do that we need to show that the simple invariant is preserved when applying adversary moves.*)
+(*Intuitively the proof is very simple, but it requires a lot of boiler plate code. *)
+
+(*First, we have a lemma which gives an explicit definition for the `applyAdversaryMove` function *)
+(*Which is not automatically generated by Why3.*)
+(*TODO: Check whether solution in definition works. Investigate why this is the case, and maybe fix this. *)
+(*Then we use this explicit definition to prove that invariant is preserved.*)
+
+(*
+let lemma applyAdversaryMoveLemma (system : systemStateT) (adversaryMove : adversaryMoveT) =
+requires {systemStateInvariantSimple system}
+ensures {applyAdversaryMove system adversaryMove =
+    match adversaryMove with 
+    | IncrementTime -> {system with time = system.time + 1}
+    | SendMsgToParty msg -> systemPartyProcessMsg system msg 
+    | DeliverMsgToGamma msg (id1, id2) ->
+      if num_occ_comp compareMsgQueueEntries msg system.msgsToGamma = 0 then system else 
+      let newMsgs = removeOne_comp compareMsgQueueEntries msg system.msgsToGamma in
+      let msgNewIds = replaceIdsInMsg msg.fst id1 id2 in
+      match gammaProcessMsg system.gamma msgNewIds system.systemSignatureState system.time with 
+        | AdversaryError -> system
+        | CorrectGamma g -> {system with gamma = g; msgsToGamma = newMsgs}
+      end 
+    | SendMsgToGamma msg -> 
+        match gammaProcessMsg system.gamma msg system.systemSignatureState system.time with
+            | AdversaryError -> system 
+            | CorrectGamma newGamma ->  {system with gamma = newGamma}
+        end
+    | SignMsg signable ->
+        let (_, newSigState) = sign adversarySide signable system.systemSignatureState  in
+        {system with systemSignatureState = newSigState}
+    | TransferFromVoid amount p id -> {system with gamma = addMoneyFromVoid system.gamma id amount p system.time}
+    | Pass -> system
+    end}
+let st = equal (applyAdversaryMove system adversaryMove)
+    (match adversaryMove with 
+    | IncrementTime -> {system with time = system.time + 1}
+    | SendMsgToParty msg -> systemPartyProcessMsg system msg 
+    | DeliverMsgToGamma msg (id1, id2) ->
+      if num_occ_comp compareMsgQueueEntries msg system.msgsToGamma = 0 then system else 
+      let newMsgs = removeOne_comp compareMsgQueueEntries msg system.msgsToGamma in
+      let msgNewIds = replaceIdsInMsg msg.fst id1 id2 in
+      match gammaProcessMsg system.gamma msgNewIds system.systemSignatureState system.time with 
+        | AdversaryError -> system
+        | CorrectGamma g -> {system with gamma = g; msgsToGamma = newMsgs}
+      end 
+    | SendMsgToGamma msg -> 
+        match gammaProcessMsg system.gamma msg system.systemSignatureState system.time with
+            | AdversaryError -> system 
+            | CorrectGamma newGamma ->  {system with gamma = newGamma}
+        end
+    | SignMsg signable ->
+        let (_, newSigState) = sign adversarySide signable system.systemSignatureState  in
+        {system with systemSignatureState = newSigState}
+    | TransferFromVoid amount p id -> {system with gamma = addMoneyFromVoid system.gamma id amount p system.time}
+    | Pass -> system
+    end) in 
+match adversaryMove with
+| IncrementTime -> assert {st};
+| DeliverMsgToGamma msg (id1, id2) ->
+    if num_occ_comp compareMsgQueueEntries msg system.msgsToGamma = 0 then assert {st} else
+    match gammaProcessMsg system.gamma (replaceIdsInMsg msg.fst id1 id2) system.systemSignatureState system.time with
+    | AdversaryError -> assert {st}
+    | CorrectGamma newGamma -> assert {st}
+    end
+| SendMsgToGamma msg -> assert {st};
+| SendMsgToParty msg -> 
+    let (newParty, updateRec) = partyProcessMsg system.honestParty msg system.getSystemView in
+    assert {st};
+| SignMsg signable -> 
+   let (sig, newSigState) = sign adversarySide signable system.systemSignatureState in
+   assert {st};
+| TransferFromVoid amount p id -> 
+    assert {st};
+| Pass -> assert {st};
+end *)
+
+let lemma applyAdversaryMovePreservesSimpleInvariant (system : systemStateT) (move : adversaryMoveT) =
+requires {systemStateInvariantSimple system}
+requires {moveApplicable system move}
+ensures {systemStateInvariantSimple (applyAdversaryMove system move)}
+let st = systemStateInvariantSimple (applyAdversaryMove system move) in
+match move with 
+| IncrementTime -> assert {st};
+| DeliverMsgToGamma msg (id1, id2) ->
+    if num_occ_comp compareMsgQueueEntries msg system.msgsToGamma = 0 then assert {st} else
+    match gammaProcessMsg system.gamma (replaceIdsInMsg msg.fst id1 id2) system.systemSignatureState system.time with
+    | AdversaryError -> assert {st}
+    | CorrectGamma newGamma -> assert {gammaCoherent newGamma}; assert {st}
+    end
+| SendMsgToGamma _ -> assert {st};
+| SendMsgToParty msg ->
+    let (newParty, _) = partyProcessMsg system.honestParty msg system.getSystemView in
+    assert {(applyAdversaryMove system move).honestParty = newParty}; 
+    assert {newParty.getSimpleParty.simplePartySide = system.honestParty.getSimpleParty.simplePartySide};
+    assert {st};
+| SignMsg newSigsState -> 
+   assert {(applyAdversaryMove system move).systemSignatureState = newSigsState};
+   assert {(applyAdversaryMove system move).honestParty = system.honestParty};
+   assert {signatureFunctionalityTransition honestPartySide system.systemSignatureState newSigsState};
+   assert {st};
+| TransferFromVoid amount p id ->
+     addMoneyFromVoidPreservesCoherent system.gamma id amount p system.time;
+    assert {st};
+| Pass -> assert {st};
+end
+
+(* We are now ready to define the function, which applies a sequence of adversary moves to a given state*)
+let rec ghost function applyMoves (initialSystem : systemStateT) (moves : list adversaryMoveT) : option systemStateT=
+requires {systemStateInvariantSimple initialSystem}
+    match moves with
+    | Nil -> Some initialSystem
+    | Cons m ms ->
+      if moveApplicable initialSystem m then 
+        applyMoves (applyAdversaryMove initialSystem m) ms
+      else 
+        None
+    end
+
+(*Next, we define reachable states*)
+predicate stateReachable (s : systemStateT) = 
+    exists initialGamma  moves . 
+        gammaCoherent initialGamma /\
+        gammaTimeCoherent initialGamma 0 /\
+        applyMoves (initialSystemState initialGamma) moves = Some s
+
+(* === Winning Condition === *)
+
+(* The adversary wins if the honest party has been requested to close the channel, earlier than `channelClosingTime` time units ago, 
+but it has not gathered all its funds on chain (as tracked by the `expectedAmount`) field of the system. *)
+let predicate adversaryWinningState (system : systemStateT) = 
+    match system.closeOrderTime with
+    | None -> false
+    | Some ct -> ct + channelClosingTime <= system.time && 
+                 system.expectedAmount > immediateAmountOnChain system.gamma honestPartySide
+    end
+
+(*The honest party wins if there is no reachable winning state for the adversary*)
+predicate honestPartyWins = forall s. stateReachable s -> not (adversaryWinningState s)
+
+end (* honestPartyVsAdversary *)
+
+
+module ClosingWorksLemmas
+
+(* 
+    In this project we often use the following convention, which we call "Statement-Proof Separation".
+
+    All modules which contain lemmas that are going to be (re)used in other modules are split into two parts:
+    1) The "Lemmas" part which declares the lemmas without proving them (using `val lemma` keywords).
+    2) The "Proofs" part which contains the proofs of the lemmas declared in the "Lemmas" part.
+
+    It is worth mentioning that the `val lemma` keywords simply assume that the declared lemma is true
+    without requiring a proof. For this reason a -Lemmas module without a corresponding Proof module does not guarantee
+    that its lemmas are true. Unfortunately, to the best of our knowledge, Why3 cannot automatically detect such an 
+    omission. We therefore provide a python script that automatically verifies that every -Lemmas module
+    has a corresponding -Proofs module. The script also checks that `val lemma` declarations only
+    appear in -Lemmas modules, or -Abstract modules (see comment in PartyInterface.mlw/AbstractPartySpec module
+    for more details on -Abstract modules). The script is available in "src/checkStatementProofConv.py". 
+    On the bright side, Why3 can automatically verify that a -Proofs module
+    contains a valid proof for each lemma declared in the corresponding -Lemmas module. The corresponding lemmas 
+    module is declared using the `:` symbol at the beginning of the -Proofs module,
+    e.g. `module ClosingWorkProofs : ClosingWorksLemmas`.
+
+    This convention serves two key purposes:
+    1) Improved readability: Typically, we are concerned with the lemma statements and whether they have been proven,
+       rather than the specifics of how the proofs are constructed. Proofs tend to be significantly longer and less readable
+       than the statements themselves. Additionally, proofs often involve many auxiliary lemmas that are not independently interesting
+       or reusable. By using Statement-Proof Separation, we maintain a clean -Lemmas module containing only the important lemma statements,
+       while the corresponding -Proofs module, which can be automatically verified by Why3, does not need to be manually reviewed.
+    2) Cleaner contexts: As mentioned, -Proofs modules often contain numerous auxiliary lemmas that are only relevant within the scope of the proof.
+       By keeping these auxiliary lemmas out of the -Lemmas modules, we prevent the unnecessary pollution of the context,
+       making it easier for automatic provers to find proofs more efficiently. The separation helps maintain a focused
+       and tidy environment for the lemmas that are meant to be reused in other parts of the code.
+
+*)
+
+
+
+use HonestPartyVsAdversary 
+use gamma.Evaluator
+use basicTypes.BasicTypes
+use partyInterface.AbstractPartySpec
+use partyInterface.SimplePartyTypes
+
+val lemma closingWorks (s : systemStateT) (t : timeT)
+requires {stateReachable s}
+requires {s.closeOrderTime = Some t}
+requires {t + channelClosingTime <= s.time}
+ensures { immediateAmountOnChain s.gamma honestPartySide >=
+          partyExpectationsFull s.gamma s.systemSignatureState s.honestParty.getSimpleParty.channelInfo s.honestPartyLastWoken s.msgsToGamma}
+
+
+end (*ClosingWorksLemmas*)
+
+module ProtocolSecureLemmas
+  (*This module follows the Statement-Proof separation convention. See the comment in honestPartyVsAdversary.mlw/ClosingWorksLemmas for more details.*)
+  use HonestPartyVsAdversary
+  
+  val lemma protocolSecure (_ : unit)
+  ensures { honestPartyWins }
+
+
+end (* ProtocolSecureLemmas*)
+
+(* ===== PROOFS:  Don't read, verify. ===== *)
+
+module ClosingWorksProofs : ClosingWorksLemmas
+(*This module follows the Statement-Proof separation convention. See the comment in honestPartyVsAdversary.mlw/ClosingWorksLemmas for more details.*)
+
+use HonestPartyVsAdversary 
+use gamma.Evaluator
+use gamma.GammaInvariant
+use gamma.EvaluatorEquivalentStatementLemmas
+use gamma.EvaluatorBasicLemmas
+use gamma.GammaBasicLemmas
+use gamma.Gamma 
+use gamma.GammaProcessMsgLemmas
+use basicTypes.BasicTypes
+use basicTypes.BasicLemmasAndProofs
+use basicTypes.Compare
+use partyInterface.AbstractPartySpec
+use partyInterface.SimplePartyTypes
+
+use listLibrary.ListLibrary
+use signaturesFunctionality.SignaturesFunctionality
+use partyInterface.GoodTransitionClosing
+use partyInterface.GoodTransition
+use partyInterface.GoodTransitionChannel
+use partyInterface.SimplePartyTypes
+use gamma.ExistsFreshIdLemmas
+use list.Append
+
+(*
+Invariant looks as follows: 
+
+Always: If our channel is not and never has been open on gamma, then there should be a msg on the queue that opens the channel.
+
+When the channel closing has been requested (say in time t0): 
+1) If the channel is not present in gamma, there should be a channel opening msg on queue with deadline <= t0 + deltaNet 
+2) If then channel is in NormalChannel on Gamma, then the channel's opening time is not greater than t0 + deltaNet and either
+    2a) The party has not seen the channel, i.e. lastWoken <= channel opening time 
+    2b) There is a msg on the queue that opens the dispute with deadline <= t0 + deltaNet + deltaWake
+3) If the channel in in DisputeOpen on gamma, then the last channel transition time is <= t0 + deltaNet + deltaWake + deltaNet
+    3a) The party has not seen the channel after the deadline, i.e. lastWoken <= channelTransitionTime + channelTimelock 
+    3b) It is after the deadline and the party is the party unCond, so it does not need anything from the dispute anymore
+    3c) There is a claim after channelTimelock msg on the queue with deadline t0 + deltaNet + deltaWake + deltaNet + channelTimelock + deltaWake 
+4) The channel is closed on gamma 
+
+Then, we can show from the time invariant that if enough time has passed form t0, then the channel has to be closed (4) or in (3b).
+*)
+
+type actualcontractStatusT = 
+    | NotYetOpened 
+    | PresentOnGamma contractT
+    | Closed 
+
+let function computeActualcontractStatus (gamma : gammaStateT) (id : transferFromPublicKeyAccountT) : actualcontractStatusT =
+    match id.destination with
+    | Void -> Closed 
+    | OtherParty -> Closed 
+    | Channel ->
+      match extractChannelByIdFromGamma gamma id with
+        | Some cs -> PresentOnGamma cs
+        | None -> if goodFunding gamma id then NotYetOpened else Closed
+      end
+    end
+
+let lemma computeActualcontractStatusNeqPublicKeyAccount (gamma : gammaStateT) (args : transferFromPublicKeyAccountT) (ch : contractT) (id : idT) (amount : amountT) (owner : partyT) =
+requires {computeActualcontractStatus gamma args = PresentOnGamma ch}
+ensures {ch.contractStatus <> PublicKeyAccount amount owner id}
+match args.destination with
+| Void -> absurd
+| OtherParty -> absurd 
+| Channel -> 
+    match extractChannelByIdFromGamma gamma args with 
+    | Some cs -> 
+        ifExtractThenNotPublicKeyAccount gamma args cs;
+        assert {cs = ch};
+        assert {ch.contractStatus <> PublicKeyAccount amount owner id}
+    | None -> absurd
+    end
+end
+
+
+
+let lemma computeActualcontractStatusPresentOnGammaCorrect (gamma : gammaStateT) (id : transferFromPublicKeyAccountT) (ch : contractT) =
+requires {computeActualcontractStatus gamma id = PresentOnGamma ch}
+ensures {member ch gamma.activeContracts}
+match id.destination with 
+| Void -> absurd
+| OtherParty -> absurd
+| Channel -> 
+    match extractChannelByIdFromGamma gamma id with 
+    | Some cs ->
+        assert {cs = ch};
+        assert {member cs gamma.activeContracts}
+    | None -> absurd
+    end
+end
+
+let predicate inputPresentOnGamma (gamma : gammaStateT) (id : transferFromPublicKeyAccountT) =
+    let input = expectedContractStatusMoveOwnCoins id in 
+    member_comp compareContractStatus input gamma.contractStatuses
+
+predicate isCorrectChannelOpeningOnQueue (msgsToGamma : list (msgToGammaT, timeT)) (sigState : signatureFunctionalityT) (gamma : gammaStateT) (args : transferFromPublicKeyAccountT) (timeLimit : timeT) =
+    exists msg t.
+        member (msg, t) msgsToGamma /\
+        correctChannelOpening args sigState gamma msg /\
+        t <= timeLimit
+    
+predicate isCorrectDisputeOpeningOnQueue (msgsToGamma : list (msgToGammaT, timeT)) (sigState : signatureFunctionalityT) (args : transferFromPublicKeyAccountT) (timeLimit : timeT) =
+    exists msg t.
+        member (msg, t) msgsToGamma /\
+        correctDisputeOpen args sigState msg /\
+        t <= timeLimit
+
+predicate isCorrectClaimAfterTimeoutOnQueue (msgsToGamma : list (msgToGammaT, timeT)) (sigState : signatureFunctionalityT) (split : conditionalOutputT) (timeLimit : timeT) =
+    exists msg t.
+        member (msg, t) msgsToGamma /\
+        correctClaimAfterTimeout split sigState msg /\
+        t <= timeLimit
+
+
+(*We start with the version of the predicate when we know that the honestParty traced the channel id, and we have been asked to close the channel*)
+(*See the next predicate `progressTracker` for the full version of the predicate*)
+predicate progressTrackerMainCase (msgsToGamma : list (msgToGammaT, timeT)) (sigs : signatureFunctionalityT) (g : gammaStateT) (currentTime : timeT) (t0 : timeT) (lastWoken : timeT) (id : transferFromPublicKeyAccountT) = 
+match computeActualcontractStatus g id with
+| Closed -> true
+| NotYetOpened -> isCorrectChannelOpeningOnQueue msgsToGamma sigs g id t0
+| PresentOnGamma cs ->
+    match cs.contractStatus with
+    | Normal f -> 
+        cs.lastContractTransitionTime <= t0 + deltaNet /\
+        (lastWoken <= cs.lastContractTransitionTime \/ 
+        isCorrectDisputeOpeningOnQueue msgsToGamma sigs f (t0 + deltaNet + deltaWake))
+    | DisputeOpen split ->
+        cs.lastContractTransitionTime <= t0 + 2*deltaNet + deltaWake /\
+        (lastWoken <= cs.lastContractTransitionTime + channelTimelock \/ 
+        other split.partyCond = honestPartySide \/
+        (
+            isCorrectClaimAfterTimeoutOnQueue msgsToGamma sigs split (t0 + 2*deltaNet + 2*deltaWake + channelTimelock) /\
+            cs.lastContractTransitionTime + channelTimelock <= currentTime
+        ))
+    | PublicKeyAccount _ _ _ -> false (*absurd*)
+    end
+end
+
+predicate progressTracker (p : simplePartyT) (msgsToGamma : list (msgToGammaT, timeT)) (sigs : signatureFunctionalityT) (g : gammaStateT) (currentTime : timeT) (closeOrder : option timeT) (lastWoken : timeT) = 
+    match closeOrder with
+    | Some t0 -> 
+        match p.channelInfo.getTracedChannelIdGeneral with 
+        | None -> true 
+        | Some args -> progressTrackerMainCase msgsToGamma sigs g currentTime t0 lastWoken args 
+        end
+    | None -> True
+    end
+
+predicate progressTrackerSys (sys : systemStateT) = 
+    progressTracker sys.honestParty.getSimpleParty sys.msgsToGamma sys.systemSignatureState sys.gamma sys.time sys.closeOrderTime sys.honestPartyLastWoken
+
+predicate whenCommitedToNotYetOpenedOpenerOnQueue (s : systemStateT) = 
+    match s.honestParty.getSimpleParty.channelInfo.makeStrict with
+    | None -> true
+    | Some ps -> 
+        computeActualcontractStatus s.gamma ps.getTracedChannelId = NotYetOpened -> 
+        (exists msg t. member (msg, t) s.msgsToGamma /\
+            correctChannelOpening ps.getTracedChannelId s.systemSignatureState s.gamma msg)
+    end
+
+predicate whenClosingRequestedThenClosing (s : systemStateT) =
+    isSome s.closeOrderTime <-> 
+    s.honestParty.getSimpleParty.closingChannel
+
+predicate timeCoherentForClosing (s : systemStateT) =
+    s.honestPartyLastWoken <= s.time  /\
+    (forall m t. member (m, t) s.msgsToGamma -> t <= s.time) /\
+    (forall ch. member ch s.gamma.activeContracts -> ch.lastContractTransitionTime <= s.time) /\
+    (forall t. s.closeOrderTime = Some t -> t <= s.time)
+
+predicate closingInvariantFull (s : systemStateT) =
+   s.honestParty.getSimpleParty.simplePartySide = honestPartySide /\
+   timeGuarantee s /\
+   gammaCoherent s.gamma /\
+   partyInvariant s.honestParty s.systemSignatureState /\
+   progressTrackerSys s /\
+   whenCommitedToNotYetOpenedOpenerOnQueue s /\
+   whenClosingRequestedThenClosing s /\
+   timeCoherentForClosing s
+
+
+(*We start by showing that if the invariant holds, then the time limit is correct*)
+   
+(*First, we show that if the invariant holds, then closing works, i.e. if it is late enough, then we have all money on our accounts*)
+(*We start with the following predicate which states that our channel is closed or effectively closed:*)
+predicate channelClosedOrAlmostClosed (s : systemStateT) = 
+match s.honestParty.getSimpleParty.channelInfo.makeStrict with
+| None -> true 
+| Some ps ->
+    match computeActualcontractStatus s.gamma ps.getTracedChannelId with
+    | Closed -> true 
+    | PresentOnGamma cs -> 
+        match cs.contractStatus with 
+        | DisputeOpen split -> cs.lastContractTransitionTime + channelTimelock <= s.time /\ other (split.partyCond) = honestPartySide 
+        | _ -> false 
+        end
+    | _ -> false
+    end 
+end
+
+(*Next, we show that if the invariant holds, and it is late enough then our channel is closed or almost closed*)
+let lemma invariantAndLateSoClosedOrAlmostClosed (s : systemStateT) (t0 : timeT) = 
+requires {closingInvariantFull s}
+requires {s.closeOrderTime = Some t0}
+requires {t0 + channelClosingTime <= s.time}
+ensures {channelClosedOrAlmostClosed s}
+let st = channelClosedOrAlmostClosed s in  
+match s.closeOrderTime with 
+| None -> absurd 
+| Some t0' -> 
+    assert {t0' = t0};
+    match s.honestParty.getSimpleParty.channelInfo.getTracedChannelIdGeneral with  
+    | None -> assert {st}
+    | Some args -> 
+        match computeActualcontractStatus s.gamma args with 
+        | Closed -> assert {st}
+        | NotYetOpened -> 
+            assert {timeGuarantee s};
+            assert {s.time <= t0 + deltaNet}; 
+            absurd
+        | PresentOnGamma cs -> 
+            match cs.contractStatus with 
+            | Normal _ -> 
+                if s.honestPartyLastWoken <= cs.lastContractTransitionTime then (
+                    assert {timeGuarantee s};
+                    assert {s.time <= s.honestPartyLastWoken + deltaWake};
+                    assert {cs.lastContractTransitionTime <= t0 + deltaNet};
+                    absurd)
+                else 
+                    (assert {timeGuarantee s};
+                    assert {progressTrackerSys s};
+                    assert {progressTrackerMainCase s.msgsToGamma s.systemSignatureState s.gamma s.time t0 s.honestPartyLastWoken args};
+                    assert {isCorrectDisputeOpeningOnQueue s.msgsToGamma s.systemSignatureState args (t0 + deltaNet + deltaWake)}; (*unfold progressTracker in Assert; unfold progressTrackerMainCase in Assert*)
+                    assert {exists msg t. member (msg, t) s.msgsToGamma /\ t <= (t0 + deltaNet + deltaWake)};
+                    assert {forall m t. member (m, t) s.msgsToGamma -> t + deltaNet >= s.time};
+                    assert {s.time <= t0 + deltaNet + deltaWake + deltaNet};
+                    absurd)
+            | DisputeOpen split -> 
+                if s.honestPartyLastWoken <= cs.lastContractTransitionTime + channelTimelock then (
+                    assert {timeGuarantee s};
+                    assert {getTracedChannelIdGeneral s.honestParty.getSimpleParty.channelInfo = Some args};
+                    assert {progressTrackerSys s};
+                    assert {progressTrackerMainCase s.msgsToGamma s.systemSignatureState s.gamma s.time t0 s.honestPartyLastWoken args};
+                    assert {cs.lastContractTransitionTime <= t0 + 2*deltaNet + deltaWake};
+                    assert {s.time <= s.honestPartyLastWoken + deltaWake};
+                    absurd )
+                else if compareParties (other split.partyCond)  honestPartySide then assert {st}
+                else (
+                    assert {timeGuarantee s};
+                    assert {isCorrectClaimAfterTimeoutOnQueue s.msgsToGamma s.systemSignatureState split (t0 + 2*deltaNet + 2*deltaWake + channelTimelock)};
+                    assert {exists msg t. member (msg, t) s.msgsToGamma /\ t <= (t0 +2 * deltaNet + 2*deltaWake + channelTimelock)};
+                    assert {s.time <= t0 + 2*deltaNet + 2*deltaWake + channelTimelock + deltaNet};
+                    absurd
+                )
+            | _ -> absurd
+            end
+        end
+    end
+end
+
+(*Next we show that if our channel is closed or almost closed, then we have no money on channel*)
+let lemma channelClosedOrAlmostClosedSoChannelExpectations0 (s : systemStateT) = 
+requires {closingInvariantFull s}
+requires {channelClosedOrAlmostClosed s} 
+ensures  {channelExpectationsG s.gamma s.systemSignatureState s.honestParty.getSimpleParty.channelInfo s.honestPartyLastWoken s.msgsToGamma s.time = 0}
+let st = channelExpectationsG s.gamma s.systemSignatureState s.honestParty.getSimpleParty.channelInfo s.honestPartyLastWoken s.msgsToGamma s.time = 0 in 
+match s.honestParty.getSimpleParty.channelInfo.makeStrict with
+| None -> assert {st};
+| Some ps ->
+    match computeActualcontractStatus s.gamma ps.getTracedChannelId with
+    | Closed ->
+      assert { computeVirtualContract ps.getTracedChannelId s.gamma ps.recordOwner s.time s.systemSignatureState = None};
+      (*^ unfold computeVirtualContract *)
+      assert {st};
+    | PresentOnGamma cs -> 
+        match cs.contractStatus with 
+        | DisputeOpen split ->
+          assert {progressTrackerSys s};
+          assert {progressTracker s.honestParty.getSimpleParty s.msgsToGamma s.systemSignatureState s.gamma s.time s.closeOrderTime s.honestPartyLastWoken};
+          assert {cs.lastContractTransitionTime + channelTimelock <= s.time}; (* unfold progressTrackerMainCase in Assert*)
+          assert {other (split.partyCond) = honestPartySide};
+          match computeVirtualContract ps.getTracedChannelId s.gamma ps.recordOwner s.time s.systemSignatureState with 
+          | None -> assert {st};
+          | Some ch -> 
+             assert {ch.contractStatus = DisputeOpen split};
+             assert {ch.lastContractTransitionTime = cs.lastContractTransitionTime};
+             assert {ps.recordOwner = honestPartySide};
+             assert {s.honestPartyLastWoken + deltaNet + deltaWake >= ch.lastContractTransitionTime + channelTimelock};
+             assert {forall msg . member msg s.msgsToGamma -> msg.snd >= ch.lastContractTransitionTime + channelTimelock - deltaNet};
+             assert {st}
+          end
+          
+        | _ -> absurd 
+        end
+    | _ -> absurd
+    end 
+end
+
+(*Next we show that if our channel is closed or almost closed, then we have all our money on chain*)
+(*We start with two easy auxiliary lemmas*) 
+
+(*It follows from `channelClosedOrAlmostClosedSoChannelExpectations0` that if our channel is closed, we have all our money on chain*)
+let lemma channelClosedOrAlmostClosedSoImmediateGeqExpected (s : systemStateT) =
+requires {closingInvariantFull s}
+requires {channelClosedOrAlmostClosed s}
+ensures { immediateAmountOnChain s.gamma honestPartySide >=
+          partyExpectationsFull s.gamma s.systemSignatureState s.honestParty.getSimpleParty.channelInfo s.honestPartyLastWoken s.msgsToGamma}
+let st = immediateAmountOnChain s.gamma honestPartySide >=
+          partyExpectationsFull s.gamma s.systemSignatureState s.honestParty.getSimpleParty.channelInfo s.honestPartyLastWoken s.msgsToGamma in
+partyExpectationsEqualG s.gamma s.systemSignatureState s.honestParty.getSimpleParty.channelInfo s.honestPartyLastWoken s.msgsToGamma s.time;
+assert {channelExpectationsG s.gamma s.systemSignatureState s.honestParty.getSimpleParty.channelInfo s.honestPartyLastWoken s.msgsToGamma s.time = 0};
+assert {immediateLossesInMoveOwnCoinsMsgs s.gamma s.systemSignatureState s.honestParty.getSimpleParty.channelInfo.recordOwnerG >= 0};
+assert {st}
+
+(*Now, we need to show that our invariant holds. We start by showing that it holds in the initial state*)
+let lemma initialStateInvariant (g : gammaStateT) =
+requires {gammaCoherent g}
+requires {forall ch. member ch g.activeContracts -> ch.lastContractTransitionTime <= 0}
+ensures { closingInvariantFull (initialSystemState g) } 
+partyInitialChannelClose honestPartySide (immediateAmountOnChain g honestPartySide);
+() (* finisher *)
+
+(*Next we show that the experiment step preserves the invariant*)
+(*let lemma isCorrectChannelOpeningOnQueueTimeIndependent (s : systemStateT) (args : transferFromPublicKeyAccountT) (timeLimit : timeT) (t : timeT) =
+requires {isCorrectChannelOpeningOnQueue s args timeLimit}
+ensures {isCorrectChannelOpeningOnQueue {s with time = t} args timeLimit}
+()*)
+
+
+let lemma progressTrackerMainCaseTimeMonotone (msgsToGamma : list (msgToGammaT, timeT)) (sigs : signatureFunctionalityT) (g : gammaStateT)  (t0 : timeT) (lastWoken : timeT) (id : transferFromPublicKeyAccountT) (t1 t2 : timeT) =
+requires {progressTrackerMainCase msgsToGamma sigs g t1 t0 lastWoken id}
+requires {t1 <= t2}
+ensures {progressTrackerMainCase msgsToGamma sigs g t2 t0 lastWoken id}
+let st = progressTrackerMainCase msgsToGamma sigs g t2 t0 lastWoken id in
+match computeActualcontractStatus g id with
+| Closed -> assert {st}
+| NotYetOpened -> assert {st}
+| PresentOnGamma cs -> 
+    match cs.contractStatus with
+    | Normal _ -> assert {st};
+    | DisputeOpen _split -> assert {st}; (*unfold progressTrackerMainCase*)
+    | _ -> absurd
+    end
+end
+
+
+let lemma progressTrackerSysTimeMonotone (s : systemStateT) (t : timeT) =
+requires {progressTrackerSys s}
+requires {s.time <= t}
+ensures {progressTrackerSys {s with time = t}}
+()
+
+
+let lemma isCorrectChannelOpeningOnQueueSignaturesMonotone (msgsToGamma : list (msgToGammaT, timeT)) (sigs : signatureFunctionalityT) (g : gammaStateT) (args : transferFromPublicKeyAccountT) (timeLimit : timeT) (newSigs : signatureFunctionalityT) =
+requires {isCorrectChannelOpeningOnQueue msgsToGamma sigs g  args timeLimit}
+requires {included sigs newSigs}
+ensures {isCorrectChannelOpeningOnQueue msgsToGamma newSigs g args timeLimit}
+let (msg, t) = any (msgToGammaT, timeT) ensures {correctChannelOpening args sigs g result.fst /\ result.snd <= timeLimit /\ member result msgsToGamma} in
+assert {correctChannelOpening args newSigs g msg};
+assert {t<= timeLimit};
+assert {member (msg,t) msgsToGamma};
+assert {isCorrectChannelOpeningOnQueue msgsToGamma newSigs g args timeLimit}
+
+let lemma isCorrectDisputeOpeningOnQueueSignaturesMonotone (msgsToGamma : list (msgToGammaT, timeT)) (sigs : signatureFunctionalityT) (args : transferFromPublicKeyAccountT) (timeLimit : timeT) (newSigs : signatureFunctionalityT) =
+requires {isCorrectDisputeOpeningOnQueue msgsToGamma sigs args timeLimit}
+requires {included sigs newSigs}
+ensures {isCorrectDisputeOpeningOnQueue msgsToGamma newSigs args timeLimit}
+let msgAndTime = any (msgToGammaT, timeT) ensures {correctDisputeOpen args sigs result.fst /\ result.snd <= timeLimit /\ member result msgsToGamma} in
+assert {correctDisputeOpen args newSigs msgAndTime.fst};
+assert {msgAndTime.snd <= timeLimit};
+assert {member msgAndTime msgsToGamma};
+assert {isCorrectDisputeOpeningOnQueue msgsToGamma newSigs args timeLimit}
+
+let lemma isCorrectClaimAfterTimeoutOnQueueSignaturesMonotone (msgsToGamma : list (msgToGammaT, timeT)) (sigs : signatureFunctionalityT) (split : conditionalOutputT) (timeLimit : timeT) (newSigs : signatureFunctionalityT) =
+requires {isCorrectClaimAfterTimeoutOnQueue msgsToGamma sigs split timeLimit}
+requires {included sigs newSigs}
+ensures {isCorrectClaimAfterTimeoutOnQueue msgsToGamma newSigs split timeLimit}
+let msgAndTime = any (msgToGammaT, timeT) ensures {correctClaimAfterTimeout split sigs result.fst /\ result.snd <= timeLimit /\ member result msgsToGamma} in
+assert {correctClaimAfterTimeout split newSigs msgAndTime.fst};
+assert {msgAndTime.snd <= timeLimit};
+assert {member msgAndTime msgsToGamma};
+assert {isCorrectClaimAfterTimeoutOnQueue msgsToGamma newSigs split timeLimit}
+
+
+let lemma progressTrackerMainCaseSignaturesMonotone (msgsToGamma : list (msgToGammaT, timeT)) (sigs : signatureFunctionalityT) (g : gammaStateT) (currentTime : timeT) (t0 : timeT) (lastWoken : timeT) (id : transferFromPublicKeyAccountT) (newSigs : signatureFunctionalityT) =
+requires {progressTrackerMainCase msgsToGamma sigs g currentTime t0 lastWoken id}
+requires {included sigs newSigs}
+ensures {progressTrackerMainCase msgsToGamma newSigs g currentTime t0 lastWoken id}
+let st = progressTrackerMainCase msgsToGamma newSigs g currentTime t0 lastWoken id in
+match computeActualcontractStatus g id with
+| Closed -> assert {st}
+| NotYetOpened ->
+    assert {isCorrectChannelOpeningOnQueue msgsToGamma sigs g id t0};
+    isCorrectChannelOpeningOnQueueSignaturesMonotone msgsToGamma sigs g id t0 newSigs;
+    assert {isCorrectChannelOpeningOnQueue msgsToGamma newSigs g id t0};
+    assert {st}
+| PresentOnGamma cs -> 
+    match cs.contractStatus with
+    | Normal _ -> assert {st};
+    | DisputeOpen _ -> assert {st}; (*unfold progressTrackerMainCase*)
+    | _ -> absurd
+    end
+end
+
+let lemma progessTrackerSysMonotone (s : systemStateT) (newSigs : signatureFunctionalityT) =
+requires {progressTrackerSys s}
+requires {included s.systemSignatureState newSigs}
+ensures {progressTrackerSys {s with systemSignatureState = newSigs}}
+let st = progressTrackerSys s in
+match s.closeOrderTime with
+| None -> assert {st}
+| Some t0 -> 
+    match s.honestParty.getSimpleParty.channelInfo.getTracedChannelIdGeneral with 
+    | None -> assert {st}
+    | Some args -> 
+        progressTrackerMainCaseSignaturesMonotone s.msgsToGamma s.systemSignatureState s.gamma s.time t0 s.honestPartyLastWoken args newSigs;
+        assert {progressTrackerSys {s with systemSignatureState = newSigs}}
+    end
+end
+
+let lemma whenCommitedToNotYetOpenedOpenerOnQueueSignaturesMonotone (s : systemStateT) (newSigs : signatureFunctionalityT) =
+requires {whenCommitedToNotYetOpenedOpenerOnQueue s}
+requires {included s.systemSignatureState newSigs}
+ensures {whenCommitedToNotYetOpenedOpenerOnQueue {s with systemSignatureState = newSigs}}
+let st = whenCommitedToNotYetOpenedOpenerOnQueue s in
+match s.honestParty.getSimpleParty.channelInfo.makeStrict with
+| None -> assert {st}
+| Some ps -> 
+    match computeActualcontractStatus s.gamma ps.getTracedChannelId with
+    | NotYetOpened -> 
+        assert {exists msg t. member (msg, t) s.msgsToGamma /\ correctChannelOpening ps.getTracedChannelId s.systemSignatureState s.gamma msg};
+        let msgAndTime = any (msgToGammaT, timeT) ensures {member result s.msgsToGamma /\ correctChannelOpening ps.getTracedChannelId s.systemSignatureState s.gamma result.fst} in
+        assert {member msgAndTime s.msgsToGamma};
+        assert {correctChannelOpening ps.getTracedChannelId newSigs s.gamma msgAndTime.fst};
+        assert {whenCommitedToNotYetOpenedOpenerOnQueue {s with systemSignatureState = newSigs}}
+    | _ -> assert {st}
+    end
+end 
+
+
+(*Send msg to party *)
+
+let lemma sendMsgToPartyWhenClosingAndTracing (s : systemStateT) (msg : partyInputT) (t0 : timeT) (oldRec newRec : partySplitsAndRevocationsRecordStrictT) = 
+requires { closingInvariantFull s }
+requires { moveApplicable s (SendMsgToParty msg) }
+requires { s.closeOrderTime = Some t0}
+requires { s.honestParty.getSimpleParty.channelInfo.makeStrict = Some oldRec }
+requires { (applyAdversaryMove s (SendMsgToParty msg)).honestParty.getSimpleParty.channelInfo.makeStrict = Some newRec  }
+ensures { progressTrackerSys (applyAdversaryMove s (SendMsgToParty msg)) }
+let newSys = applyAdversaryMove s (SendMsgToParty msg) in
+let (newParty, updateRec) = partyProcessMsg s.honestParty msg s.getSystemView in
+assert {s.honestParty.getSimpleParty.channelInfo.makeStrict = Some oldRec};
+assert {newParty.getSimpleParty.channelInfo.makeStrict = Some newRec};
+let id = oldRec.getTracedChannelId in 
+assert {timeGuarantee s};
+assert {goodTransition s.honestParty.getSimpleParty s.getSystemView newSys.honestParty.getSimpleParty updateRec};
+assert {goodTransitionForChannel s.honestParty.getSimpleParty.channelInfo s.getSystemView newSys.honestParty.getSimpleParty.channelInfo  updateRec};
+assert {newRec.getTracedChannelId = id};
+assert {oldRec.getTracedChannelId = id};
+assert {progressTrackerSys s};
+assert {progressTrackerMainCase s.msgsToGamma s.systemSignatureState s.gamma s.time t0 s.honestPartyLastWoken id}; (*unfold progressTrackerSys in Assert*)
+assert {newSys.systemSignatureState = updateRec.newSigState};
+(*assert {progressTrackerMainCase  t0 id};*)
+match computeActualcontractStatus s.gamma oldRec.getTracedChannelId with
+| NotYetOpened -> 
+    assert {isCorrectChannelOpeningOnQueue s.msgsToGamma s.systemSignatureState s.gamma id t0};
+    assert {newSys.systemSignatureState = updateRec.newSigState};
+    assert {included s.systemSignatureState newSys.systemSignatureState};
+    let (msg, t) = any (msgToGammaT, timeT) ensures {member result s.msgsToGamma /\ correctChannelOpening oldRec.getTracedChannelId s.systemSignatureState s.gamma result.fst /\ result.snd <= t0} in
+    assert { member (msg, t) newSys.msgsToGamma};
+    assert {correctChannelOpening newRec.getTracedChannelId newSys.systemSignatureState newSys.gamma msg};
+    (*assert {progressTrackerMainCase newSys t0 id};*)
+    assert {progressTrackerMainCase newSys.msgsToGamma newSys.systemSignatureState newSys.gamma newSys.time t0 newSys.honestPartyLastWoken id}; (*unfold progressTrackerMainCase*)
+    assert {progressTrackerSys newSys} (*unfold progressTrackerSys*)
+| PresentOnGamma ch ->
+    match ch.contractStatus with
+    | Normal f ->
+        if s.honestPartyLastWoken > ch.lastContractTransitionTime then (
+          assert {isCorrectDisputeOpeningOnQueue s.msgsToGamma s.systemSignatureState f (t0 + deltaNet + deltaWake)};
+          (*^unfold progressTrackerSys in Assert; unfold progressTracker in Assert; unfold progressTrackerMainCaseInAssert*)
+          assert {newSys.systemSignatureState = updateRec.newSigState};
+          assert {included s.systemSignatureState newSys.systemSignatureState};
+          let (msg, _) = any (msgToGammaT, timeT) ensures {member result s.msgsToGamma /\ correctDisputeOpen f s.systemSignatureState result.fst /\ result.snd <= (t0 + deltaNet + deltaWake)} in
+          assert {correctDisputeOpen f newSys.systemSignatureState msg}; (*unfold correctDisputeOpen*)
+          assert {isCorrectDisputeOpeningOnQueue newSys.msgsToGamma newSys.systemSignatureState f (t0 + deltaNet + deltaWake)};
+          assert { ch.lastContractTransitionTime <= (t0 + deltaNet) }; (*unfold progressTrackerSys in Assert4; unfold progressTracker in Assert4; unfold progressTrackerMainCase in Assert4*)
+          (*assert {progressTrackerMainCase newSys t0 id};*)
+          assert {progressTrackerMainCase newSys.msgsToGamma newSys.systemSignatureState newSys.gamma newSys.time t0 newSys.honestPartyLastWoken id};
+          assert {progressTrackerSys newSys} (*unfold progressTrackerSys*)
+         )
+         else if (s.getSystemView.lastWoken = updateRec.timeProcessedTo) then (
+          assert {newSys.honestParty.getSimpleParty.channelInfo.getTracedChannelIdGeneral = Some newRec.getTracedChannelId};
+          assert { newSys.closeOrderTime = Some t0};
+          assert {progressTrackerSys newSys} (*unfold progressTrackerSys; unfold progressTracker; eliminate_definition; crush (alt. unfold newSys; rewrite applyAdversaryMove'spec; finisher in first branch)*)
+         ) else (
+          assert {ch.lastContractTransitionTime <= t0 + deltaNet};
+          assert {s.time <= t0 + deltaNet + deltaWake};
+          assert {whenClosingSendsOpenDispute s.honestParty.getSimpleParty newParty.getSimpleParty s.getSystemView.gammaState s.getSystemView.lastWoken updateRec};
+          assert {extractChannelByIdFromGamma s.gamma id = Some ch}; (*unfold computeActualcontractStatus in H3*)
+          assert {s.honestParty.getSimpleParty.closingChannel};
+          assert {exists msg. member msg updateRec.msgsToSend /\ correctDisputeOpen f newSys.systemSignatureState msg};
+          let msg = any msgToGammaT ensures {member result updateRec.msgsToSend /\ correctDisputeOpen f newSys.systemSignatureState result} in
+          assert {member (msg, s.time) newSys.msgsToGamma};
+          assert {newSys.systemSignatureState = updateRec.newSigState};
+          assert {included s.systemSignatureState newSys.systemSignatureState};
+          assert {correctDisputeOpen f newSys.systemSignatureState msg};
+          assert {isCorrectDisputeOpeningOnQueue newSys.msgsToGamma newSys.systemSignatureState f (t0 + deltaNet + deltaWake)};
+          (*assert {progressTrackerMainCase newSys t0 id};*)
+          assert {progressTrackerMainCase newSys.msgsToGamma newSys.systemSignatureState newSys.gamma newSys.time t0 newSys.honestPartyLastWoken id};
+          assert {progressTrackerSys newSys} (*unfold progressTrackerSys*)
+         )
+    | DisputeOpen split ->
+        if compareParties (other split.partyCond) honestPartySide || s.time <= ch.lastContractTransitionTime + channelTimelock then (
+            (*assert {progressTrackerMainCase newSys t0 id};*)
+            assert {progressTrackerMainCase newSys.msgsToGamma newSys.systemSignatureState newSys.gamma newSys.time t0 newSys.honestPartyLastWoken id};
+            assert {progressTrackerSys newSys} (*unfold progressTrackerSys, split, unfold progressTracker*)
+        ) else if s.honestPartyLastWoken > ch.lastContractTransitionTime + channelTimelock then (
+            assert {isCorrectClaimAfterTimeoutOnQueue s.msgsToGamma s.systemSignatureState split (t0 + 2*deltaNet + 2*deltaWake + channelTimelock)};
+            assert {included s.systemSignatureState newSys.systemSignatureState};
+            let (msg, t) = any (msgToGammaT, timeT) ensures {member result s.msgsToGamma /\ correctClaimAfterTimeout split s.systemSignatureState result.fst /\ result.snd <= (t0 + 2*deltaNet + 2*deltaWake + channelTimelock)} in
+            assert {correctClaimAfterTimeout split newSys.systemSignatureState msg};
+            assert {member (msg, t) newSys.msgsToGamma};
+            assert {isCorrectClaimAfterTimeoutOnQueue newSys.msgsToGamma newSys.systemSignatureState split (t0 + 2*deltaNet + 2*deltaWake + channelTimelock)}; (*unfold correctClaimAfterTimeout*)
+            (*assert {progressTrackerMainCase newSys t0 id};*)
+            assert {progressTrackerMainCase newSys.msgsToGamma newSys.systemSignatureState newSys.gamma newSys.time t0 newSys.honestPartyLastWoken id};
+            assert {progressTrackerSys newSys}  (*unfold progressTrackerSys*)
+        )
+        else if (s.getSystemView.lastWoken = updateRec.timeProcessedTo) then assert {progressTrackerSys newSys} (*unfold progressTrackerSys*)
+        else (
+            assert {ch.lastContractTransitionTime <= t0 + 2*deltaNet + deltaWake};
+            assert {s.honestPartyLastWoken <= ch.lastContractTransitionTime + channelTimelock};
+            assert {s.time <= t0 + 2*deltaNet + 2*deltaWake + channelTimelock};
+            assert {whenDisputeOpenAfterTimeoutAndCorrectSideSendClaim s.honestParty.getSimpleParty newParty.getSimpleParty s.getSystemView.gammaState s.getSystemView.lastWoken updateRec};
+            assert {extractChannelByIdFromGamma s.gamma id = Some ch}; (*unfold computeActualcontractStatus in H8*)
+            assert {exists msg. member msg updateRec.msgsToSend /\ correctClaimAfterTimeout split newSys.systemSignatureState msg}; (*unfold whenDisputeOpenAfterTimeoutAndCorrectSideSendClaim in Assert1*)
+            let msg = any msgToGammaT ensures {member result updateRec.msgsToSend /\ correctClaimAfterTimeout split newSys.systemSignatureState result} in
+            assert {member (msg, s.time) newSys.msgsToGamma};
+            assert {s.honestParty.getSimpleParty.closingChannel};
+            assert {included s.systemSignatureState newSys.systemSignatureState};
+            assert {correctClaimAfterTimeout split newSys.systemSignatureState msg};
+            assert {isCorrectClaimAfterTimeoutOnQueue newSys.msgsToGamma newSys.systemSignatureState split (t0 + 2*deltaNet + 2*deltaWake + channelTimelock)};
+            (*assert {progressTrackerMainCase newSys t0 id};*)
+            assert {progressTrackerMainCase newSys.msgsToGamma newSys.systemSignatureState newSys.gamma newSys.time t0 newSys.honestPartyLastWoken id};
+            assert {progressTrackerSys newSys} (*unfold progressTrackerSys*)
+        )
+    | _ -> absurd
+    end
+| Closed ->
+    assert {progressTrackerSys newSys} (*unfold progressTrackerSys*)
+end
+
+let lemma closingOrderSoCloseNow (msg : partyInputT) =
+requires {msg.isCloseOrder}
+ensures {msg = FromEnv CloseNow}
+match msg with
+| FromEnv CloseNow -> ()
+| _ -> absurd
+end
+
+let lemma sendMsgToPartyPreservesWhenClosingInvariantThanClosing (s : systemStateT) (msg : partyInputT) =
+requires {closingInvariantFull s}
+ensures {whenClosingRequestedThenClosing (applyAdversaryMove s (SendMsgToParty msg))}
+assert {whenClosingRequestedThenClosing s};
+let newS = applyAdversaryMove s (SendMsgToParty msg) in
+assert {newS = systemPartyProcessMsg s msg};
+let (_a, _b) = partyProcessMsg s.honestParty msg s.getSystemView in
+let closeNow =  newS.honestParty.getSimpleParty.closingChannel || msg.isCloseOrder in 
+assert {newS.closeOrderTime = if closeNow && not (isSome s.closeOrderTime) then Some s.time else s.closeOrderTime};
+match s.honestParty.getSimpleParty.closingChannel, s.closeOrderTime, newS.honestParty.getSimpleParty.closingChannel, newS.closeOrderTime with 
+| _x, _y, True, Some _ -> assert { whenClosingRequestedThenClosing newS};
+| _x, _y, False, None -> assert {  whenClosingRequestedThenClosing newS};
+| False, Some _x, _y, _z -> absurd 
+| True, None, _x, _y -> absurd 
+| _x, Some _y, _z, None -> absurd
+| True, Some _x, False, Some _y-> absurd 
+| False, None, False, Some _x ->
+  assert {closeNow};
+  assert {msg.isCloseOrder};
+  assert {msg = FromEnv CloseNow};
+  assert {newS.honestParty.getSimpleParty.closingChannel};
+  absurd
+| False, None, True, None -> absurd 
+end 
+
+let lemma sendMsgToPartyWhenClosingRequest (s : systemStateT) (newRec : partySplitsAndRevocationsRecordStrictT) (input : partyInputT) = 
+requires {closingInvariantFull s}
+requires {moveApplicable s (SendMsgToParty input)}
+requires {(applyAdversaryMove s (SendMsgToParty input)).honestParty.getSimpleParty.channelInfo.makeStrict = Some newRec}
+requires {s.closeOrderTime = None}
+requires {(applyAdversaryMove s (SendMsgToParty input)).closeOrderTime = Some s.time}
+ensures { progressTrackerSys (applyAdversaryMove s (SendMsgToParty input)) } 
+let newSys = applyAdversaryMove s (SendMsgToParty input) in
+let (newParty, updateRec) = partyProcessMsg s.honestParty input s.getSystemView in
+match computeActualcontractStatus s.gamma newRec.getTracedChannelId with
+| NotYetOpened -> 
+    match s.honestParty.getSimpleParty.channelInfo.makeStrict with
+    | Some oldRec ->
+        assert {goodTransitionForChannel s.honestParty.getSimpleParty.channelInfo s.getSystemView newSys.honestParty.getSimpleParty.channelInfo  updateRec};
+        assert {whenCommitedToNotYetOpenedOpenerOnQueue s};
+        assert {exists msg t. member (msg, t) s.msgsToGamma /\ correctChannelOpening oldRec.getTracedChannelId s.systemSignatureState s.gamma msg};
+        let (msg, t) = any (msgToGammaT, timeT) ensures {member result s.msgsToGamma /\ correctChannelOpening oldRec.getTracedChannelId s.systemSignatureState s.gamma result.fst} in
+        assert {t <= s.time};
+        assert {Some oldRec = makeStrict s.honestParty.getSimpleParty.channelInfo};
+        assert {Some newRec = makeStrict newSys.honestParty.getSimpleParty.channelInfo};
+        assert {bestHsSplitTransition s.honestParty.getSimpleParty.channelInfo.bestSplitReceivedG  newSys.honestParty.getSimpleParty.channelInfo.bestSplitReceivedG};
+        assert {oldRec.getTracedChannelId = newRec.getTracedChannelId};
+        assert {newSys.honestParty.getSimpleParty.channelInfo.getTracedChannelIdGeneral = Some oldRec.getTracedChannelId};
+        assert {computeActualcontractStatus newSys.gamma oldRec.getTracedChannelId = NotYetOpened};
+        assert {newSys.gamma = s.gamma};
+        assert {included s.systemSignatureState newSys.systemSignatureState};
+        assert {correctChannelOpening (getTracedChannelId oldRec) newSys.systemSignatureState newSys.gamma msg}; 
+        assert {progressTrackerMainCase newSys.msgsToGamma newSys.systemSignatureState newSys.gamma newSys.time s.time newSys.honestPartyLastWoken oldRec.getTracedChannelId};
+        assert {progressTrackerSys (applyAdversaryMove s (SendMsgToParty input))}
+        (*unfold progressTrackerSys; unfold progressTrackerMainCase; unfold isCorrectChannelOpeningOnQueue*)
+    | None ->
+      let id = newRec.getTracedChannelId in 
+      assert {s.getSystemView.gammaState = s.gamma};
+      assert {not (isOurChannelInNormal s.getSystemView.gammaState id)}; (*unfold isOurChannelInNormal*)
+      assert {exists msg. member msg updateRec.msgsToSend /\ correctChannelOpening id updateRec.newSigState s.getSystemView.gammaState msg};
+      let msg = any msgToGammaT ensures { member result updateRec.msgsToSend /\ correctChannelOpening id updateRec.newSigState s.getSystemView.gammaState result} in 
+      assert {member (msg, s.time) newSys.msgsToGamma}; (*unfold newSys*)
+      assert {progressTrackerMainCase newSys.msgsToGamma newSys.systemSignatureState newSys.gamma newSys.time s.time newSys.honestPartyLastWoken id};
+      assert {progressTrackerSys (applyAdversaryMove s (SendMsgToParty input))} (*unfold progressTrackerSys*)
+    end
+| PresentOnGamma ch ->
+  assert {ch.lastContractTransitionTime <= s.time};
+  assert {newParty = newSys.honestParty};
+  assert {newParty.getSimpleParty.closingChannel};
+  (*assert {progressTrackerSys s};
+  assert {progressTrackerMainCase s.msgsToGamma s.systemSignatureState s.gamma s.time s.time s.honestPartyLastWoken newRec.getTracedChannelId};*)
+  assert {extractChannelByIdFromGamma s.gamma newRec.getTracedChannelId = Some ch}; (*unfold computeActualcontractStatus in H*)
+  match ch.contractStatus with
+    | Normal f ->
+        assert {newParty.getSimpleParty.closingChannel};
+        if (s.getSystemView.lastWoken = updateRec.timeProcessedTo) && (s.honestParty.getSimpleParty.closingChannel) then (
+          assert { s.getSystemView.lastWoken = updateRec.timeProcessedTo};
+          assert { s.honestParty.getSimpleParty.closingChannel};
+          assert {newSys.honestPartyLastWoken =  updateRec.timeProcessedTo};
+          assert {s.honestParty.getSimpleParty.channelInfo.makeStrict <> None};
+          match s.honestParty.getSimpleParty.channelInfo.makeStrict with 
+          | Some _ ->
+            assert {progressTrackerSys s};
+            assert {progressTrackerSys newSys}
+          | None -> absurd 
+          end
+        )
+        else (
+        assert {(s.getSystemView.lastWoken <> updateRec.timeProcessedTo || not s.honestParty.getSimpleParty.closingChannel) };
+        assert {whenClosingSendsOpenDispute s.honestParty.getSimpleParty newParty.getSimpleParty s.getSystemView.gammaState s.getSystemView.lastWoken updateRec};
+        assert {exists msg. member msg updateRec.msgsToSend /\ correctDisputeOpen f newSys.systemSignatureState msg};
+        let msg = any msgToGammaT ensures {member result updateRec.msgsToSend /\ correctDisputeOpen f newSys.systemSignatureState result} in
+        assert {member (msg, s.time) newSys.msgsToGamma};
+        assert {included s.systemSignatureState newSys.systemSignatureState};
+        assert {correctDisputeOpen f newSys.systemSignatureState msg};
+        assert {progressTrackerMainCase newSys.msgsToGamma newSys.systemSignatureState newSys.gamma newSys.time s.time newSys.honestPartyLastWoken newRec.getTracedChannelId};
+        (*unfold progressTrackerMainCase*)
+        assert {progressTrackerSys (applyAdversaryMove s (SendMsgToParty input))} (*unfold progressTrackerSys*)
+        )
+    | DisputeOpen split -> 
+        assert {updateRec.timeProcessedTo = s.time};
+        assert {newSys.honestPartyLastWoken = s.time};
+        if compareParties (other split.partyCond) newParty.getSimpleParty.simplePartySide then (
+          assert {other split.partyCond = honestPartySide};
+          assert {progressTrackerMainCase newSys.msgsToGamma newSys.systemSignatureState newSys.gamma newSys.time s.time newSys.honestPartyLastWoken newRec.getTracedChannelId};
+          assert {progressTrackerSys (applyAdversaryMove s (SendMsgToParty input))} (*unfold progressTrackerSys*)
+        ) else if updateRec.timeProcessedTo <= ch.lastContractTransitionTime + channelTimelock then (
+          assert {s.time <= ch.lastContractTransitionTime + channelTimelock};
+          assert {progressTrackerMainCase newSys.msgsToGamma newSys.systemSignatureState newSys.gamma newSys.time s.time newSys.honestPartyLastWoken newRec.getTracedChannelId};
+          assert {progressTrackerSys (applyAdversaryMove s (SendMsgToParty input))} (*unfold progressTrackerSys*)
+        )
+        else if (s.getSystemView.lastWoken = updateRec.timeProcessedTo) && (s.honestParty.getSimpleParty.closingChannel) then (
+          assert { s.getSystemView.lastWoken = updateRec.timeProcessedTo};
+          assert { s.honestParty.getSimpleParty.closingChannel};
+          assert {newSys.honestPartyLastWoken =  updateRec.timeProcessedTo};
+          assert {s.honestParty.getSimpleParty.channelInfo.makeStrict <> None};
+          match s.honestParty.getSimpleParty.channelInfo.makeStrict with 
+          | Some _ ->
+            assert {progressTrackerSys s};
+            assert {progressTrackerSys newSys}
+          | None -> absurd 
+          end
+        )
+        else (
+            assert {(s.getSystemView.lastWoken <> updateRec.timeProcessedTo || not s.honestParty.getSimpleParty.closingChannel) };
+            assert {whenDisputeOpenAfterTimeoutAndCorrectSideSendClaim s.honestParty.getSimpleParty newParty.getSimpleParty s.getSystemView.gammaState s.getSystemView.lastWoken updateRec};
+            assert {whenDisputeOpenAfterTimeoutAndCorrectSideSendClaimInner newParty.getSimpleParty s.getSystemView.gammaState updateRec};
+            assert {exists msg. member msg updateRec.msgsToSend /\ correctClaimAfterTimeout split newSys.systemSignatureState msg};
+            (*^unfold whenDisputeOpenAfterTimeoutAndCorrectSideSendClaim in Assert*)
+            let msg = any msgToGammaT ensures {member result updateRec.msgsToSend /\ correctClaimAfterTimeout split newSys.systemSignatureState result} in
+            assert {member (msg, s.time) newSys.msgsToGamma};
+            assert {included s.systemSignatureState newSys.systemSignatureState};
+            assert {correctClaimAfterTimeout split newSys.systemSignatureState msg};
+            assert {progressTrackerMainCase newSys.msgsToGamma newSys.systemSignatureState newSys.gamma newSys.time s.time newSys.honestPartyLastWoken newRec.getTracedChannelId};
+            (*^unfold progressTrackerMainCase*)
+            assert {progressTrackerSys (applyAdversaryMove s (SendMsgToParty input))} (*unfold progressTrackerSys*)
+        ) 
+    | PublicKeyAccount _ _ _ ->
+        absurd
+  end
+| Closed ->
+    assert {progressTrackerSys (applyAdversaryMove s (SendMsgToParty input))}
+    (*unfold progressTrackerSys*)
+end
+ 
+
+
+(*let lemma closeOrderSoCloseNow (msg : partyInputT) = 
+requires {msg.isCloseOrder}
+ensures {msg = FromEnv CloseNow}
+match msg with 
+| FromEnv CloseNow -> assert {msg = FromEnv CloseNow}
+| _ -> absurd 
+end*)
+
+
+let lemma sendMsgToPartyPreservesProgressTracker (s : systemStateT) (msg : partyInputT) =
+requires { closingInvariantFull s }
+requires { moveApplicable s (SendMsgToParty msg) }
+ensures { progressTrackerSys (applyAdversaryMove s (SendMsgToParty msg)) }
+let newSys = applyAdversaryMove s (SendMsgToParty msg) in
+let oldParty' = s.honestParty in
+let oldParty = oldParty'.getSimpleParty in
+let (newParty', _) = partyProcessMsg oldParty' msg s.getSystemView in
+let newParty = newParty'.getSimpleParty in 
+let st = progressTrackerSys newSys in 
+match newParty.channelInfo.makeStrict, newSys.closeOrderTime with 
+  | Some nps, Some t0 ->
+    match oldParty.channelInfo.makeStrict, s.closeOrderTime with 
+      | Some ops, Some t0' -> 
+        assert {t0 = t0'};
+        sendMsgToPartyWhenClosingAndTracing s msg t0 ops nps;
+        assert {st};
+      | None, Some _ -> absurd;
+      | _, None ->
+        (*assert {msg.isCloseOrder};
+        assert {msg = FromEnv CloseNow};*)
+        sendMsgToPartyWhenClosingRequest s nps msg;
+        assert {st}
+     end
+  | _ -> assert {st} (*unfold progessTrackerSys*)
+end
+
+let lemma sendMsgToPartyPreserveswhenCommitedToNotYetOpenedOpenerOnQueue (s : systemStateT) (msg : partyInputT) =
+requires { closingInvariantFull s }
+requires { moveApplicable s (SendMsgToParty msg) }
+ensures { whenCommitedToNotYetOpenedOpenerOnQueue (applyAdversaryMove s (SendMsgToParty msg)) }
+let newSys = applyAdversaryMove s (SendMsgToParty msg) in
+let oldParty' = s.honestParty in
+let oldParty = oldParty'.getSimpleParty in
+let (newParty', updateRec) = partyProcessMsg oldParty' msg s.getSystemView in
+let newParty = newParty'.getSimpleParty in
+let st = whenCommitedToNotYetOpenedOpenerOnQueue newSys in
+assert {goodTransitionForChannel oldParty.channelInfo s.getSystemView newParty.channelInfo updateRec};
+match oldParty.channelInfo.makeStrict, newParty.channelInfo.makeStrict with 
+    | Some ops, Some nps -> 
+        assert {ops.getTracedChannelId = nps.getTracedChannelId};
+        let id = ops.getTracedChannelId in
+        match computeActualcontractStatus s.gamma id with
+        | NotYetOpened ->
+            assert {included s.systemSignatureState newSys.systemSignatureState};
+            assert {exists msg t. member (msg, t) s.msgsToGamma /\ correctChannelOpening ops.getTracedChannelId s.systemSignatureState s.gamma msg};
+            let (msg, t) = any (msgToGammaT, timeT) ensures {member result s.msgsToGamma /\ correctChannelOpening ops.getTracedChannelId s.systemSignatureState s.gamma result.fst} in
+            assert {correctChannelOpening nps.getTracedChannelId newSys.systemSignatureState newSys.gamma msg};
+            assert {member (msg, t) (updateMsgs (s.time) (s.msgsToGamma) updateRec)};
+            assert {member (msg, t) newSys.msgsToGamma};
+            assert {exists msg t. member (msg, t) newSys.msgsToGamma /\ correctChannelOpening nps.getTracedChannelId newSys.systemSignatureState newSys.gamma msg};
+            assert {st};
+        | _ -> assert {st};
+        end
+    | None, Some nps -> 
+        let id = nps.getTracedChannelId in 
+        match computeActualcontractStatus s.gamma id with
+        | NotYetOpened -> 
+            assert {whenComingToChannelChannelOpenerSentOrChannelPresentOnGamma oldParty s.getSystemView newParty updateRec};
+            assert {not isOurChannelInNormal s.gamma id}; (*unfold isOurChannelInNormal*)
+            assert {exists msg. member msg updateRec.msgsToSend /\ correctChannelOpening id updateRec.newSigState s.getSystemView.gammaState msg};
+            let msg = any msgToGammaT ensures {member result updateRec.msgsToSend /\ correctChannelOpening id updateRec.newSigState s.getSystemView.gammaState result} in
+            assert {member (msg, s.time) newSys.msgsToGamma};
+            assert {st};
+        | _ -> assert {st};
+        end
+    | None, None -> assert {st};
+    | Some _, None -> absurd
+    end
+
+(*============ msg to gamma =============*)
+
+
+let ghost predicate isMsgImportant (s : systemStateT) (msg : msgToGammaT) =
+match s.honestParty.getSimpleParty.channelInfo.makeStrict with
+| None -> False
+| Some ps -> 
+    let chId = ps.getTracedChannelId in
+    match computeActualcontractStatus s.gamma chId with
+     | NotYetOpened -> correctChannelOpening chId s.systemSignatureState s.gamma msg
+     | PresentOnGamma ch -> 
+        match ch.contractStatus with
+        | Normal f -> correctDisputeOpen f s.systemSignatureState msg
+        | DisputeOpen split ->
+            (correctClaimAfterTimeout split s.systemSignatureState msg &&
+            ch.lastContractTransitionTime + channelTimelock <= s.time)
+        | _ -> False
+        end
+    | Closed -> False
+    end 
+end
+
+let lemma skipNonImportantPreservesProgressTracker (s : systemStateT) (msgAndTime : (msgToGammaT, timeT)) =
+requires {progressTrackerSys s}
+requires {not (isMsgImportant s msgAndTime.fst)}
+requires {member msgAndTime s.msgsToGamma}
+ensures {progressTrackerSys {s with msgsToGamma = removeOne_comp compareMsgQueueEntries msgAndTime s.msgsToGamma}}
+let newSys = {s with msgsToGamma = removeOne_comp compareMsgQueueEntries msgAndTime s.msgsToGamma} in
+match s.closeOrderTime with
+| None -> assert {progressTrackerSys newSys};
+| Some t0 ->
+    match s.honestParty.getSimpleParty.channelInfo.makeStrict with
+    | None -> assert {progressTrackerSys newSys}; (*unfold progressTrackerSys*)
+    | Some ps -> 
+        let chId = ps.getTracedChannelId in
+        assert {s.honestParty.getSimpleParty.channelInfo.getTracedChannelIdGeneral = Some chId};
+        assert {progressTrackerSys s};
+        assert {progressTrackerMainCase s.msgsToGamma s.systemSignatureState s.gamma s.time t0 s.honestPartyLastWoken chId};
+        match computeActualcontractStatus s.gamma ps.getTracedChannelId with
+        | NotYetOpened ->
+          
+          assert {isCorrectChannelOpeningOnQueue s.msgsToGamma s.systemSignatureState s.gamma chId t0};
+          assert {isCorrectChannelOpeningOnQueue newSys.msgsToGamma newSys.systemSignatureState newSys.gamma chId t0};
+          assert {progressTrackerSys newSys};
+        | PresentOnGamma ch -> 
+            match ch.contractStatus with
+            | Normal f ->
+              assert {ch.lastContractTransitionTime <= t0 + deltaNet}; 
+              assert { (s.honestPartyLastWoken <= ch.lastContractTransitionTime) \/ 
+                       (isCorrectDisputeOpeningOnQueue s.msgsToGamma s.systemSignatureState f (t0 + deltaNet + deltaWake))};
+              assert { (newSys.honestPartyLastWoken <= ch.lastContractTransitionTime) \/ 
+                       (isCorrectDisputeOpeningOnQueue newSys.msgsToGamma newSys.systemSignatureState f (t0 + deltaNet + deltaWake)) } ; (*finisher*)
+              assert {progressTrackerMainCase newSys.msgsToGamma newSys.systemSignatureState newSys.gamma newSys.time t0 newSys.honestPartyLastWoken chId};
+              assert {progressTrackerSys newSys};
+            | DisputeOpen split ->
+              assert {progressTrackerMainCase s.msgsToGamma s.systemSignatureState s.gamma s.time t0 s.honestPartyLastWoken chId};
+              assert {ch.lastContractTransitionTime <= t0 + 2*deltaNet + deltaWake}; 
+              assert {s.honestPartyLastWoken <= ch.lastContractTransitionTime + channelTimelock \/ 
+                      other split.partyCond = honestPartySide \/
+                       (
+                          isCorrectClaimAfterTimeoutOnQueue s.msgsToGamma s.systemSignatureState split (t0 + 2*deltaNet + 2*deltaWake + channelTimelock) /\
+                          ch.lastContractTransitionTime + channelTimelock <= s.time 
+                       )
+              };
+              if not (isCorrectClaimAfterTimeoutOnQueue s.msgsToGamma s.systemSignatureState split (t0 + 2*deltaNet + 2*deltaWake + channelTimelock) && ch.lastContractTransitionTime + channelTimelock <= s.time) then (
+                assert {progressTrackerMainCase newSys.msgsToGamma newSys.systemSignatureState newSys.gamma newSys.time t0 newSys.honestPartyLastWoken chId};
+                assert {progressTrackerSys newSys}
+              ) else ( 
+                let opener = any (msgToGammaT, timeT) ensures {member result s.msgsToGamma /\ correctClaimAfterTimeout split s.systemSignatureState result.fst /\ result.snd <= (t0 + 2*deltaNet + 2*deltaWake + channelTimelock) } in
+                assert {not (isMsgImportant s msgAndTime.fst)};
+                assert {not correctClaimAfterTimeout split s.systemSignatureState msgAndTime.fst}; (*unfold isMsgImportant in Assert*)
+                assert {opener <> msgAndTime};
+                assert { isCorrectClaimAfterTimeoutOnQueue s.msgsToGamma s.systemSignatureState split (t0 + 2*deltaNet + 2*deltaWake + channelTimelock) -> isCorrectClaimAfterTimeoutOnQueue newSys.msgsToGamma newSys.systemSignatureState split (t0 + 2*deltaNet + 2*deltaWake + channelTimelock)};
+                assert {newSys.honestPartyLastWoken <= ch.lastContractTransitionTime + channelTimelock \/ 
+                      other split.partyCond = honestPartySide \/
+                       (
+                          isCorrectClaimAfterTimeoutOnQueue newSys.msgsToGamma newSys.systemSignatureState split (t0 + 2*deltaNet + 2*deltaWake + channelTimelock) /\
+                          ch.lastContractTransitionTime + channelTimelock <= newSys.time
+                       )};
+                assert {progressTrackerMainCase newSys.msgsToGamma newSys.systemSignatureState newSys.gamma newSys.time t0 newSys.honestPartyLastWoken chId};
+                assert {progressTrackerSys newSys}; (*unfold progressTracker*)
+            )
+            | _ -> assert {progressTrackerSys newSys}
+            end
+        | Closed -> assert {progressTrackerSys newSys}
+        end 
+    end
+end
+
+let lemma inputSpentSoNotImportant (s : systemStateT) (msg : msgToGammaT) =
+requires {isSpent (expectedContractStatus msg) s.gamma}
+ensures {not (isMsgImportant s msg)}
+let st = not (isMsgImportant s msg) in
+if not (isMsgImportant s msg) then assert {st} else (
+    assert {isMsgImportant s msg};
+    match s.honestParty.getSimpleParty.channelInfo.makeStrict with
+    | None -> assert {st}
+    | Some ps -> 
+        let chId = ps.getTracedChannelId in
+        match computeActualcontractStatus s.gamma chId with
+        | NotYetOpened ->
+            match msg with 
+            | MoveOwnCoinsOnChain (args, _, _, _) -> 
+                assert {args = chId};
+                assert {expectedContractStatus msg = expectedContractStatusMoveOwnCoins chId};
+                assert {isSpent (expectedContractStatusMoveOwnCoins chId) s.gamma};
+                assert {not (isSpent (expectedContractStatusMoveOwnCoins chId) s.gamma)};
+                absurd
+            | _ -> absurd 
+            end
+        | PresentOnGamma ch -> 
+            match ch.contractStatus with
+            | Normal _ ->
+                match msg with 
+                | OpenDispute (_, _, _) -> 
+                    assert {expectedContractStatus msg = ch.contractStatus};
+                    assert {isSpent ch.contractStatus s.gamma};
+                    assert {not (isSpent ch.contractStatus s.gamma)};
+                    absurd
+                | _ -> absurd
+                end
+            | DisputeOpen _ ->
+                match msg with 
+                | ClaimAfterTimeout (_, _, _) -> 
+                    assert {expectedContractStatus msg = ch.contractStatus};
+                    assert {isSpent ch.contractStatus s.gamma};
+                    assert {not (isSpent ch.contractStatus s.gamma)};
+                    absurd
+                | _ -> absurd
+                end
+            | _ -> absurd
+            end
+        | Closed -> absurd
+        end 
+    end
+)
+
+let lemma inputNotOnGammaSoNoImportant (s : systemStateT) (msg : msgToGammaT) = 
+requires { forall x . member x s.gamma.activeContracts -> x.contractStatus <> expectedContractStatus msg }
+ensures { not (isMsgImportant s msg) }
+let _input = expectedContractStatus msg in
+let st = not (isMsgImportant s msg) in
+if st then assert {st} else (
+    assert {isMsgImportant s msg};
+    match s.honestParty.getSimpleParty.channelInfo.makeStrict with
+    | None -> assert {st}
+    | Some ps -> 
+        let chId = ps.getTracedChannelId in
+        match computeActualcontractStatus s.gamma chId with
+        | NotYetOpened ->
+            match msg with 
+            | MoveOwnCoinsOnChain (args, _, _, _) -> 
+                assert {args = chId};
+                assert {expectedContractStatus msg = expectedContractStatusMoveOwnCoins chId};
+                assert {inputPresentOnGamma s.gamma chId};
+                assert {forall x. member x s.gamma.activeContracts -> x.contractStatus <> expectedContractStatusMoveOwnCoins chId};
+                assert {not (isMsgImportant s msg)};
+                absurd
+            | _ -> absurd 
+            end
+        | PresentOnGamma ch -> 
+            match ch.contractStatus with
+            | Normal _ ->
+                match msg with 
+                | OpenDispute (_, _, _) -> 
+                    assert {expectedContractStatus msg = ch.contractStatus};
+                    assert {forall x. member x s.gamma.activeContracts -> x.contractStatus <> ch.contractStatus};
+                    assert {not (isMsgImportant s msg)};
+                    absurd
+                | _ -> absurd
+                end
+            | DisputeOpen _split ->
+                match msg with 
+                | ClaimAfterTimeout (_, _, _) -> 
+                    assert {expectedContractStatus msg = ch.contractStatus};
+                    assert {forall x. member x s.gamma.activeContracts -> x.contractStatus <> ch.contractStatus};
+                    assert {not (isMsgImportant s msg)};
+                    absurd
+                | _ -> absurd
+                end
+            | _ -> absurd
+            end
+        | Closed -> absurd
+        end 
+    end
+
+)
+
+let lemma verificationCheckFailSoNotImportant (s : systemStateT) (msg : msgToGammaT) =
+requires {not (verificationCheck msg s.systemSignatureState)}
+ensures {not (isMsgImportant s msg)}
+let st = not (isMsgImportant s msg) in
+match s.honestParty.getSimpleParty.channelInfo.makeStrict with
+| None -> assert {st}
+| Some ps -> 
+    let chId = ps.getTracedChannelId in
+    match computeActualcontractStatus s.gamma chId with
+    | NotYetOpened -> 
+        match msg with 
+        | MoveOwnCoinsOnChain (_, _, _, _) -> 
+            assert {st};
+        | _ -> assert {st};
+        end
+    | PresentOnGamma ch -> 
+        match ch.contractStatus with
+        | Normal _ ->
+            match msg with 
+            | OpenDispute (_, _, _) -> 
+                assert {st};
+            | _ -> assert {st};
+            end
+        | DisputeOpen _split ->
+            match msg with 
+            | ClaimAfterTimeout (_, _, _) -> 
+                assert {st};
+            | _ -> assert {st};
+            end
+        | _ -> absurd
+        end
+    | Closed -> assert {st};
+    end
+end
+
+let lemma msgNotApplicableSoNotImportant (s : systemStateT) (msg : msgToGammaT) =
+requires {not (msgApplicable (expectedContractStatus msg) msg)}
+ensures {not (isMsgImportant s msg)}
+let st = not (isMsgImportant s msg) in
+match s.honestParty.getSimpleParty.channelInfo.makeStrict with
+| None -> assert {st}
+| Some ps -> 
+    let chId = ps.getTracedChannelId in
+    match computeActualcontractStatus s.gamma chId with
+    | NotYetOpened -> 
+        match msg with 
+        | MoveOwnCoinsOnChain (_args, _, _, _) -> 
+            assert {not (goodMsg msg)};
+            assert {st};
+        | _ -> assert {st};
+        end
+    | PresentOnGamma ch -> 
+        match ch.contractStatus with
+        | Normal _ ->
+            match msg with 
+            | OpenDispute (_, _, _) -> 
+                assert {st};
+            | _ -> assert {st};
+            end
+        | DisputeOpen _split ->
+            match msg with 
+            | ClaimAfterTimeout (_split, _, _) -> 
+                assert {st};
+            | _ -> assert {st};
+            end
+        | _ -> absurd
+        end
+    | Closed -> assert {st};
+    end
+end
+
+let lemma timeCheckFailsSoNotImportant (s : systemStateT) (ch : contractT) (msg : msgToGammaT) = 
+requires {gammaCoherent s.gamma}
+requires {member ch s.gamma.activeContracts}
+requires {expectedContractStatus msg = ch.contractStatus}
+requires {not (timeCheck msg ch.lastContractTransitionTime s.time)}
+ensures  {not (isMsgImportant s msg)}
+let st = not (isMsgImportant s msg) in
+match makeStrict s.honestParty.getSimpleParty.channelInfo with
+| None -> assert {not (isMsgImportant s msg)}
+| Some ps -> 
+    let chId = ps.getTracedChannelId in
+    match computeActualcontractStatus s.gamma chId with
+    | NotYetOpened -> assert {st}; 
+    | Closed -> assert {st}; 
+    | PresentOnGamma ch -> 
+        match ch.contractStatus with 
+        | Normal _ ->
+          match msg with 
+            | MoveOwnCoinsOnChain (_, _, _, _) -> absurd 
+            | _ -> assert {st} (*unfold isMsgImportant*)
+          end 
+        | DisputeOpen split -> 
+            match msg with 
+            | ClaimAfterTimeout (split', _, _) ->
+              if correctClaimAfterTimeout split (s.systemSignatureState) msg then (
+                assert {split = split'};
+                assert {ch.contractStatus = msg.expectedContractStatus};
+                assert {st};
+              ) else assert {st}
+            | _ -> absurd 
+            end
+        | _ -> absurd
+        end
+    end
+end
+
+
+let lemma gammaProcessMsgNoneSoNonImportant (s: systemStateT) (msg : msgToGammaT) =
+requires {gammaCoherent s.gamma}
+requires {checkFreshness msg s.gamma}
+requires {gammaProcessMsgFresh s.gamma msg s.systemSignatureState s.time = None}
+ensures {not (isMsgImportant s msg)}
+let st = not (isMsgImportant s msg) in
+if not (checkFreshness msg s.gamma) then absurd else
+let input = expectedContractStatus msg in
+if isSpent input s.gamma then (
+    inputSpentSoNotImportant s msg; 
+    assert {st}
+) else
+let filtered = filter (fun x -> compareContractStatus x.contractStatus input) s.gamma.activeContracts in
+match filtered with
+    | Nil ->
+      assert {forall x. member x s.gamma.activeContracts -> x.contractStatus <> input};
+      inputNotOnGammaSoNoImportant s msg; 
+      assert {st};
+    | Cons inputFull _ ->
+        match contractProcessMsg inputFull msg s.systemSignatureState s.time with 
+        | Some _ -> absurd
+        | None ->
+           if not verificationCheck msg s.systemSignatureState then assert {st} else
+           if not msgApplicable inputFull.contractStatus msg then assert {st} else
+           if not timeCheck msg inputFull.lastContractTransitionTime s.time then assert {st} else 
+           absurd
+        end
+end
+
+let lemma msgNotFreshSoAdversaryError (g : gammaStateT) (msg : msgToGammaT) (s : signatureFunctionalityT) (t : timeT) =
+requires {not (checkFreshness msg g)}
+ensures {gammaProcessMsg g msg s t = AdversaryError}
+()
+
+let lemma correctGammaSoMsgFresh (g1 g2 : gammaStateT) (msg : msgToGammaT) (s : signatureFunctionalityT) (t : timeT) =
+requires {gammaProcessMsg g1 msg s t = CorrectGamma g2}
+ensures {checkFreshness msg g1}
+()
+
+let lemma msgImportantIdIndependent (s : systemStateT) (msg : msgToGammaT) (id1 id2 : idT) =
+ensures {isMsgImportant s msg = isMsgImportant s (replaceIdsInMsg msg id1 id2)}
+match s.honestParty.getSimpleParty.channelInfo.makeStrict with
+| None -> assert {isMsgImportant s msg = isMsgImportant s (replaceIdsInMsg msg id1 id2)}
+| Some ps -> 
+    let chId = ps.getTracedChannelId in
+    match computeActualcontractStatus s.gamma chId with
+     | NotYetOpened ->
+           match msg with
+           | MoveOwnCoinsOnChain (_, _, _, _) -> assert {isMsgImportant s msg = isMsgImportant s (replaceIdsInMsg msg id1 id2)}
+           | _ -> assert {isMsgImportant s msg = isMsgImportant s (replaceIdsInMsg msg id1 id2)}
+           end
+     | PresentOnGamma ch -> 
+        match ch.contractStatus with
+        | Normal _ ->
+            match msg with 
+            | OpenDispute _ ->
+                assert {isMsgImportant s msg = isMsgImportant s (replaceIdsInMsg msg id1 id2)}
+                (*^ unfold isMsgImportant; unfold correctDisputeOpen*)
+            | _ -> assert {isMsgImportant s msg = isMsgImportant s (replaceIdsInMsg msg id1 id2)}
+            end
+        | DisputeOpen _ ->
+            match msg with
+            | ClaimAfterTimeout _ ->
+                assert {isMsgImportant s msg = isMsgImportant s (replaceIdsInMsg msg id1 id2)}
+                (*^ unfold isMsgImportant; unfold correctClaimAfterTimeout*)
+            | _ -> assert {isMsgImportant s msg = isMsgImportant s (replaceIdsInMsg msg id1 id2)}
+            end
+        | _ -> assert {isMsgImportant s msg = isMsgImportant s (replaceIdsInMsg msg id1 id2)}
+        end
+    | Closed -> assert {isMsgImportant s msg = isMsgImportant s (replaceIdsInMsg msg id1 id2)}
+    end 
+end
+
+let function computeActualTracedcontractStatus (g : gammaStateT) (s : simplePartyT) : option actualcontractStatusT =
+match s.channelInfo.makeStrict with
+| None -> None
+| Some ps -> Some (computeActualcontractStatus g ps.getTracedChannelId)
+end
+
+let function getMsgFunding (msg : msgToGammaT) : transferFromPublicKeyAccountT = 
+match msg with 
+| OpenDispute (hs, _, _) -> hs.split.condOutput.id
+| ClaimAfterTimeout (s, _, _) -> s.id
+| Revoke (s, _, _, _) -> s.id
+| MoveOwnCoinsOnChain (args, _, _, _) -> args
+end
+
+let lemma computeActualcontractStatusCorrect (g : gammaStateT) (id : transferFromPublicKeyAccountT) (ch : contractT) =
+requires {computeActualcontractStatus g id = PresentOnGamma ch}
+ensures {ch.contractStatus.extractChannelId = Some id}
+match id.destination with 
+| Void -> absurd
+| OtherParty -> absurd
+| Channel ->
+    match extractChannelByIdFromGamma g id with
+    | Some cs -> assert {cs.contractStatus.extractChannelId = Some id}
+    | None -> absurd
+    end
+end
+
+
+let lemma msgFundingIrrelevantSoNotMsgImportant (s : systemStateT) (msg : msgToGammaT) (ps : partySplitsAndRevocationsRecordStrictT) =
+requires { s.honestParty.getSimpleParty.channelInfo.makeStrict = Some ps }
+requires { ps.getTracedChannelId.fundingId <> (getMsgFunding msg).fundingId }
+ensures {not (isMsgImportant s msg)}
+let st = not (isMsgImportant s msg) in
+match s.honestParty.getSimpleParty.channelInfo.makeStrict with
+| None -> assert {st}
+| Some ps -> 
+    let chId = ps.getTracedChannelId in
+    assert {chId.fundingId <> msg.getMsgFunding.fundingId};
+    match computeActualcontractStatus s.gamma chId with
+    | NotYetOpened -> 
+        match msg with 
+        | MoveOwnCoinsOnChain (args, _, _, _) -> 
+            assert {args <> ps.getTracedChannelId};
+            assert {not (isMsgImportant s msg)};
+            assert {st};
+        | _ -> assert {st};
+        end
+    | PresentOnGamma ch ->
+        assert {ch.contractStatus.extractChannelId = Some chId};
+        match ch.contractStatus with
+        | Normal f ->
+            assert {f = chId};
+            match msg with 
+            | OpenDispute (hs, _, _) -> 
+                assert {hs.split.condOutput.id <> ps.getTracedChannelId};
+                assert {not (isMsgImportant s msg)};
+                assert {st};
+            | _ -> assert {st};
+            end
+        | DisputeOpen split ->
+            assert {split.id = ps.getTracedChannelId};
+            match msg with 
+            | ClaimAfterTimeout (_, _, _) -> 
+                assert {not (isMsgImportant s msg)};
+                assert {st};
+            | _ -> assert {st};
+            end
+        | _ -> assert {st};
+        end
+    | Closed -> assert {st};
+    end
+end
+
+let lemma idDifferentSoExpectedDifferent (msg : msgToGammaT) (ch : contractStatusT) (id : transferFromPublicKeyAccountT) = 
+requires {ch.extractChannelId = Some id}
+requires {msg.getMsgFunding <> id}
+ensures {expectedContractStatus msg <> ch}
+match msg with 
+| OpenDispute (hs, _, _) -> assert {hs.split.condOutput.id <> id};
+| ClaimAfterTimeout (s, _, _) -> assert {s.id <> id};
+| Revoke (s, _, _, _) -> assert {s.id <> id};
+| MoveOwnCoinsOnChain (args, _, _, _) -> assert {args <> id};
+end
+
+let function extractChannelIdT (ch : contractStatusT) : idT =
+match ch with
+| Normal f -> f.fundingId
+| DisputeOpen split -> split.id.fundingId
+| PublicKeyAccount _ _ id -> id
+end
+
+let lemma expectedChanelInputPreservesIdT (msg : msgToGammaT) = 
+ensures {msg.expectedContractStatus.extractChannelIdT = msg.getMsgFunding.fundingId}
+match msg with
+| OpenDispute (_, _, _) -> assert {msg.expectedContractStatus.extractChannelIdT = msg.getMsgFunding.fundingId}
+| ClaimAfterTimeout (_, _, _) -> assert {msg.expectedContractStatus.extractChannelIdT = msg.getMsgFunding.fundingId}
+| Revoke (_, _, _, _) -> assert {msg.expectedContractStatus.extractChannelIdT = msg.getMsgFunding.fundingId}
+| MoveOwnCoinsOnChain (_, _, _, _) -> assert {msg.expectedContractStatus.extractChannelIdT = msg.getMsgFunding.fundingId}
+end
+
+let lemma msgFreshSoNewIds (g : gammaStateT) (msg : msgToGammaT) = 
+requires {checkFreshness msg g}
+ensures {forall x. member x msg.evalOut -> (x.extractChannelIdT = msg.getMsgFunding.fundingId \/ idFreshForGamma g x.extractChannelIdT)}
+match msg with
+| OpenDispute (_, _, _) -> 
+    assert {forall x. member x msg.evalOut -> (x.extractChannelIdT = msg.getMsgFunding.fundingId \/ idFreshForGamma g x.extractChannelIdT)}
+| ClaimAfterTimeout (_, _, _) ->
+    assert {forall x. member x msg.evalOut -> (x.extractChannelIdT = msg.getMsgFunding.fundingId \/ idFreshForGamma g x.extractChannelIdT)}
+| Revoke (_, _, _, _) ->
+    assert {forall x. member x msg.evalOut -> (x.extractChannelIdT = msg.getMsgFunding.fundingId \/ idFreshForGamma g x.extractChannelIdT)}
+| MoveOwnCoinsOnChain (_, _, _, _) ->
+    assert {forall x. member x msg.evalOut -> (x.extractChannelIdT = msg.getMsgFunding.fundingId \/ idFreshForGamma g x.extractChannelIdT)}
+end
+    
+
+let lemma extractChannelIdExtractChannelIds (ch : contractStatusT) (args : transferFromPublicKeyAccountT) = 
+requires {ch.extractChannelId = Some args }
+ensures {ch.extractChannelIdT = args.fundingId}
+()
+
+(*let lemma onGammaSoIdNotFresh (ch : contractStatusT) (g : gammaStateT) = 
+requires {gammaCoherent g}
+requires {member ch g.allContracts}
+ensures {not (idFreshForGamma g ch.extractChannelIdT)}
+()*)
+
+let lemma gammaProcessMsgUnrelatedPreservesProgressTrackerMain (g1 g2 : gammaStateT) (msg : msgToGammaT) (msgs : list (msgToGammaT, timeT)) (sigs : signatureFunctionalityT) (t : timeT) (t0 : timeT) (lastWoken : timeT) (args : transferFromPublicKeyAccountT) =
+requires {gammaCoherent g1}
+requires {gammaCoherent g2}
+requires {checkFreshness msg g1}
+requires {member (expectedContractStatusMoveOwnCoins args) g1.allContracts}
+requires {args.destination = Channel}
+requires {progressTrackerMainCase msgs sigs g1 t t0 lastWoken args}
+requires {gammaProcessMsgFresh g1 msg sigs t = Some g2}
+requires {(getMsgFunding msg).fundingId <> args.fundingId}
+ensures {progressTrackerMainCase msgs sigs g2 t t0 lastWoken args}
+let st = progressTrackerMainCase msgs sigs g2 t t0 lastWoken args in
+let inputArgs = expectedContractStatusMoveOwnCoins args in 
+let ch = any contractT ensures {member result g1.activeContracts /\ result.contractStatus = expectedContractStatus msg} in
+gammaProcessMsgFreshSomeSpec g1 g2 msg sigs t ch;
+assert {g2 = gammaProcessMsgDirect g1 msg t ch};
+assert {ch.contractStatus <> inputArgs};
+(*assert {not (idFreshForGamma g1 ch.contractStatus.extractChannelIdT)};*)
+assert {not (args.fundingId = msg.getMsgFunding.fundingId)}; 
+assert {not (idFreshForGamma g1 args.fundingId)}; (*unfold idFreshForGamma; unfold usedIds*)
+assert {forall x. member x msg.evalOut -> x.extractChannelIdT <> args.fundingId};
+assert {forall x. member x msg.evalOut -> x.extractChannelId <> Some args};
+assert {not (member inputArgs msg.evalOut)};
+assert {member inputArgs g1.contractStatuses <-> member inputArgs g2.contractStatuses};
+assert {member inputArgs g1.allContracts <-> member inputArgs g2.allContracts};
+assert {forall x. extractChannelByIdFromGamma g1 args = Some x <-> (member x g1.activeContracts /\ x.contractStatus.extractChannelId = Some args)};
+assert {forall x. extractChannelByIdFromGamma g2 args = Some x <-> (member x g2.activeContracts /\ x.contractStatus.extractChannelId = Some args)};
+assert {extractChannelByIdFromGamma g1 args = None <-> (forall y. member y g1.activeContracts -> y.contractStatus.extractChannelId <> Some args)};
+assert {extractChannelByIdFromGamma g2 args = None <-> (forall y. member y g2.activeContracts -> y.contractStatus.extractChannelId <> Some args)};
+assert {extractChannelByIdFromGamma g1 args = None <-> extractChannelByIdFromGamma g2 args = None};
+assert {forall x . extractChannelByIdFromGamma g1 args = Some x <-> extractChannelByIdFromGamma g2 args = Some x};
+assert {extractChannelByIdFromGamma g1 args = extractChannelByIdFromGamma g2 args};
+assert {inputUnspent args g1 = inputUnspent args g2};
+assert {computeActualcontractStatus g1 args = computeActualcontractStatus g2 args};
+assert {inputPresentOnGamma g1 args = inputPresentOnGamma g2 args}; (*unfold inputPresentOnGamma*)
+match computeActualcontractStatus g1 args with
+| NotYetOpened ->
+    assert {isCorrectChannelOpeningOnQueue msgs sigs g1 args t0};
+    let (m, _) = any (msgToGammaT, timeT)
+      ensures {member result msgs /\
+               correctChannelOpening args sigs g1 result.fst /\
+               result.snd <= t0} in 
+    assert {correctChannelOpening args sigs g2 m};                 
+    assert {isCorrectChannelOpeningOnQueue msgs sigs g2 args t0};
+    assert {st};
+| Closed -> assert {st};
+| PresentOnGamma ch -> 
+    match ch.contractStatus with
+    | Normal _ -> assert {st}; (*unfold progressTrackerMainCase*)
+    | DisputeOpen _ -> assert {st}; (*unfold progressTrackerMainCase*)
+    | _ -> assert {st};
+    end
+end
+
+let lemma progressTrackerMainCaseSoArgsInputUsed (msgs : list (msgToGammaT, timeT)) (sigs : signatureFunctionalityT) (g : gammaStateT) (t t0 lastWoken : timeT) (args : transferFromPublicKeyAccountT) =
+requires {gammaCoherent g}
+requires {0 <= args.amount <= args.totalAmount}
+requires {progressTrackerMainCase msgs sigs g t t0 lastWoken args}
+requires {args.destination = Channel}
+ensures {member (expectedContractStatusMoveOwnCoins args) g.allContracts}
+match computeActualcontractStatus g args with
+| NotYetOpened ->
+    assert {isCorrectChannelOpeningOnQueue msgs sigs g args t0};
+    let msg = any msgToGammaT ensures {correctChannelOpening args sigs g result} in 
+    match msg with 
+    | MoveOwnCoinsOnChain (_, _, _, _) ->
+      assert {inputPresentOnGamma g args};
+      assert {member (expectedContractStatusMoveOwnCoins args) g.contractStatuses};
+      assert {member (expectedContractStatusMoveOwnCoins args) g.allContracts};  
+    | _ -> absurd;
+    end
+| Closed ->
+    assert {isSpent (expectedContractStatusMoveOwnCoins args) g};
+    assert {member (expectedContractStatusMoveOwnCoins args) g.allContracts};
+| PresentOnGamma ch ->
+    match ch.contractStatus with
+    | Normal _ ->
+        assert {member (expectedContractStatusMoveOwnCoins args) g.allContracts};
+    | DisputeOpen _ ->
+        assert {member (expectedContractStatusMoveOwnCoins args) g.allContracts};
+    | _ -> absurd
+    end
+end
+
+let lemma badArgsSoClosed (g : gammaStateT) (args : transferFromPublicKeyAccountT) =
+requires {gammaCoherent g}
+requires {args.destination <> Channel \/ args.amount > args.totalAmount \/ args.amount < 0}
+ensures {computeActualcontractStatus g args = Closed}
+match args.destination with
+| Void -> assert {computeActualcontractStatus g args = Closed}
+| OtherParty -> assert {computeActualcontractStatus g args = Closed}
+| Channel -> 
+    match extractChannelByIdFromGamma g args with 
+    | Some ch -> 
+        match ch.contractStatus with
+        | Normal f ->
+            assert {f = args};
+            assert {f.destination = Channel};
+            absurd
+        | DisputeOpen split ->
+            assert {split.id = args};
+            assert {split.id.destination = Channel};
+            assert {member (Normal split.id) g.allContracts};
+            assert {0 <= args.amount <= args.totalAmount};
+            absurd
+        | _ -> absurd
+        end
+    | None -> assert {computeActualcontractStatus g args = Closed}
+    end
+end
+
+let lemma extractMsgFundingIdIndependent (msg : msgToGammaT) (id1 id2 : idT) =
+ensures {getMsgFunding (replaceIdsInMsg msg id1 id2) = msg.getMsgFunding}
+match msg with 
+| OpenDispute (_, _, _) -> assert {getMsgFunding (replaceIdsInMsg msg id1 id2) = msg.getMsgFunding}
+| ClaimAfterTimeout (_, _, _) -> assert {getMsgFunding (replaceIdsInMsg msg id1 id2) = msg.getMsgFunding}
+| Revoke (_, _, _, _) -> assert {getMsgFunding (replaceIdsInMsg msg id1 id2) = msg.getMsgFunding}
+| MoveOwnCoinsOnChain (_, _, _, _) -> assert {getMsgFunding (replaceIdsInMsg msg id1 id2) = msg.getMsgFunding}
+end
+
+let lemma normalIdTSameButIdDifferentSoClosed (g : gammaStateT) (args args' : transferFromPublicKeyAccountT) =
+requires {gammaCoherent g}
+requires {member args.expectedContractStatusMoveOwnCoins g.allContracts}
+requires {args.fundingId = args'.fundingId}
+requires {args <> args'}
+requires {member (Normal args') g.allContracts}
+ensures {computeActualcontractStatus g args = Closed}
+match args.destination with
+| Void -> assert {computeActualcontractStatus g args = Closed}
+| OtherParty -> assert {computeActualcontractStatus g args = Closed}
+| Channel -> 
+    match extractChannelByIdFromGamma g args with 
+    | Some ch -> 
+        match ch.contractStatus with
+        | Normal f ->
+            assert {f = args};
+            assert {member (Normal f) g.allContracts};
+            assert {f = args'};
+            absurd 
+        | DisputeOpen split ->
+            assert {split.id = args};
+            assert {member (Normal args) g.allContracts};
+            assert {args = args'};
+            absurd
+        | _ -> absurd
+        end
+    | None -> assert {computeActualcontractStatus g args = Closed}
+    end
+end
+
+(*The invariant gives us limit on the current time, as long as we are not in closed*)
+let function computeTimeLimit (ch : actualcontractStatusT) (t0 : timeT) : option timeT =
+    match ch with
+    | Closed -> None
+    | NotYetOpened -> Some (t0 + deltaNet)
+    | PresentOnGamma cs -> 
+        match cs.contractStatus with 
+        | Normal _f -> Some (t0 + 2*deltaNet + deltaWake)
+        | DisputeOpen _ -> None (*Here we cannot force the other party to claim after channelTimelock, so there is no time limit*)
+        | _ -> None (*absurd*)
+        end
+    end
+
+let lemma timeLimitCorrect (s : systemStateT) (t0 limit : timeT) (args : transferFromPublicKeyAccountT) =
+requires {closingInvariantFull s}
+requires {s.closeOrderTime = Some t0}
+requires {s.honestParty.getSimpleParty.channelInfo.getTracedChannelIdGeneral = Some args}
+requires {computeTimeLimit (computeActualcontractStatus s.gamma args) t0 = Some limit}
+ensures {s.time <= limit}
+let st = s.time <= limit in
+assert {timeGuarantee s};
+assert {timeCoherentForClosing s};
+assert {progressTrackerSys s};
+match s.closeOrderTime with
+| None -> absurd
+| Some t0' -> 
+    assert {t0' = t0};
+    match s.honestParty.getSimpleParty.channelInfo.getTracedChannelIdGeneral with
+    | None -> absurd
+    | Some args -> 
+        assert {progressTrackerMainCase (s.msgsToGamma) (s.systemSignatureState) (s.gamma) (s.time) t0 (s.honestPartyLastWoken) args};
+        match computeActualcontractStatus s.gamma args with 
+        | Closed -> absurd
+        | NotYetOpened -> 
+            assert {limit = t0 + deltaNet};
+            assert {s.time <= t0 + deltaNet};
+            assert {st}
+        | PresentOnGamma cs -> 
+            match cs.contractStatus with 
+            | Normal _ -> 
+                assert {limit = t0 + 2*deltaNet + deltaWake};
+                assert {s.time <= t0 + 2*deltaNet + deltaWake};
+                (*unfold progressTrackerMainCase in Assert1*)
+            | _ -> absurd
+            end
+        end
+    end
+end
+
+let lemma msgFreshSoExtractAccountId (msg : msgToGammaT) (id1 id2 : idT) =
+ensures {forall ch . member ch (replaceIdsInMsg msg id1 id2).evalOut -> ch.extractAccountId = None \/ ch.extractAccountId = Some id1 \/ ch.extractAccountId = Some id2}
+match msg with 
+| OpenDispute (_, _, _) -> 
+    assert {forall ch . member ch (replaceIdsInMsg msg id1 id2).evalOut -> ch.extractAccountId = None \/ ch.extractAccountId = Some id1 \/ ch.extractAccountId = Some id2}
+| ClaimAfterTimeout (_, _, _) ->
+    assert {forall ch . member ch (replaceIdsInMsg msg id1 id2).evalOut -> ch.extractAccountId = None \/ ch.extractAccountId = Some id1 \/ ch.extractAccountId = Some id2}
+| Revoke (_, _, _, _) ->
+    assert {forall ch . member ch (replaceIdsInMsg msg id1 id2).evalOut -> ch.extractAccountId = None \/ ch.extractAccountId = Some id1 \/ ch.extractAccountId = Some id2}
+| MoveOwnCoinsOnChain (args, _, _, _) ->
+    match args.destination with
+    | Void ->
+        assert {forall ch . member ch (replaceIdsInMsg msg id1 id2).evalOut -> ch.extractAccountId = None \/ ch.extractAccountId = Some id1 \/ ch.extractAccountId = Some id2}
+    | OtherParty -> 
+        assert {forall ch . member ch (replaceIdsInMsg msg id1 id2).evalOut -> ch.extractAccountId = None \/ ch.extractAccountId = Some id1 \/ ch.extractAccountId = Some id2}
+    | Channel -> 
+        assert {forall ch . member ch (replaceIdsInMsg msg id1 id2).evalOut -> ch.extractAccountId = None \/ ch.extractAccountId = Some id1 \/ ch.extractAccountId = Some id2}
+    end
+end
+
+
+
+let lemma progressTrackerMainCasePreservedWhenProcessingMatchingIds (msgAndTime : (msgToGammaT, timeT)) (id1 id2 : idT) (msgs : list (msgToGammaT, timeT)) (sigs : signatureFunctionalityT) (g1 g2 : gammaStateT) (t t0 lastWoken : timeT) (args : transferFromPublicKeyAccountT) =
+requires {gammaCoherent g1}
+requires {gammaCoherent g2}
+requires {idFreshForGamma g1 id1}
+requires {idFreshForGamma g1 id2}
+requires {member msgAndTime msgs}
+requires {msgAndTime.fst.getMsgFunding.fundingId = args.fundingId}
+requires {gammaProcessMsgFresh g1 (replaceIdsInMsg msgAndTime.fst id1 id2) sigs t = Some g2}
+requires {progressTrackerMainCase msgs sigs g1 t t0 lastWoken args}
+requires {forall tl. computeTimeLimit (computeActualcontractStatus g1 args) t0 = Some tl ->  t <= tl}
+requires {lastWoken <= t}
+ensures {progressTrackerMainCase (removeOne msgAndTime msgs) sigs g2 t t0 lastWoken args}
+let st = progressTrackerMainCase (removeOne msgAndTime msgs) sigs g2 t t0 lastWoken args in
+if not (compareDestinations args.destination Channel) || args.amount > args.totalAmount || args.amount < 0 then assert {st} (*unfold progessTrackerMainCase*) else 
+let newMsg = replaceIdsInMsg msgAndTime.fst id1 id2 in
+match newMsg with
+| MoveOwnCoinsOnChain (args', _, _, _) -> 
+    assert {newMsg.expectedContractStatus = args'.expectedContractStatusMoveOwnCoins};
+    let ch = any contractT ensures {member result g1.activeContracts /\ result.contractStatus = args'.expectedContractStatusMoveOwnCoins} in
+    assert {args.expectedContractStatusMoveOwnCoins = args'.expectedContractStatusMoveOwnCoins};
+    assert {member ch g1.activeContracts};
+    assert {inputUnspent args g1};
+    assert {forall x. member x g1.activeContracts -> member x.contractStatus g1.contractStatuses};
+    assert {forall x. member x g1.activeContracts -> member x.contractStatus g1.allContracts};
+    assert {forall x. member x g1.activeContracts -> x.contractStatus.extractChannelId = Some args -> not (inputUnspent args g1)};
+    assert {forall x. member x g1.activeContracts -> x.contractStatus.extractChannelId <> Some args};
+    assert {extractChannelByIdFromGamma g1 args = None};
+    assert {computeActualcontractStatus g1 args = NotYetOpened}; 
+    if not (compareArgs args args') then (
+         (*assert {isSpent args'.expectedContractStatusMoveOwnCoins g2};*)
+        gammaProcessMsgFreshSomeSoExistsMsgFull g1 g2 newMsg sigs t;
+        let ch = any contractT ensures {member result g1.activeContracts /\ result.contractStatus = args'.expectedContractStatusMoveOwnCoins} in
+        assert {member args.expectedContractStatusMoveOwnCoins g1.allContracts}; 
+        assert {member args.expectedContractStatusMoveOwnCoins g2.allContracts};
+        assert {args.expectedContractStatusMoveOwnCoins.extractAccountId = Some args.fundingId};
+        (*assert {forall x. member x newMsg.evalOut -> (x.extractChannelIdT = newMsg.getMsgFunding.fundingId \/ idFreshForGamma g1 x.extractChannelIdT)};*)
+        assert {not (idFreshForGamma g1 args.fundingId)}; (*unfold idFreshForGamma*)
+        assert {id1 <> args.fundingId};
+        assert {id2 <> args.fundingId};
+        assert {not (member args.expectedContractStatusMoveOwnCoins newMsg.evalOut)};
+        assert {expectedContractStatusMoveOwnCoins args = expectedContractStatus newMsg};
+        (*gammaProcessMsgFreshSomeSpec g1 g2 newMsg sigs t ch;*)
+        (*assert {not (member args.expectedContractStatusMoveOwnCoins g1.contractStatuses)};*)
+        assert {not (member args.expectedContractStatusMoveOwnCoins g2.contractStatuses)};
+        assert {isSpent args.expectedContractStatusMoveOwnCoins g2};
+        assert {forall x. member x newMsg.evalOut -> x.extractChannelId <> Some args};
+        assert {forall x. member x (removeOne_comp compareSimpleChannel ch g1.activeContracts) -> x.contractStatus.extractChannelId <> Some args};
+        assert {forall x. member x g2.activeContracts -> x.contractStatus.extractChannelId <> Some args};
+        assert {extractChannelByIdFromGamma g2 args = None};
+        assert {computeActualcontractStatus g2 args = Closed}; 
+        assert {st}
+    ) else (
+        assert {t <= t0 + deltaNet}; (*unfold progressTrackerMainCase in Requires2*)
+        assert {args = args'};
+        assert {args.destination = Channel};
+        let newChStatus = Normal args in 
+        let newCh = {contractStatus = newChStatus; lastContractTransitionTime = t} in
+        assert {member newCh g2.activeContracts};
+        assert {extractChannelByIdFromGamma g2 args = Some newCh};
+        assert {computeActualcontractStatus g2 args = PresentOnGamma newCh};
+        assert {progressTrackerMainCase msgs sigs g2 t t0 lastWoken args};
+        assert {st}
+    )
+
+| OpenDispute (hs, _, _) -> 
+    assert {newMsg.expectedContractStatus = Normal hs.split.condOutput.id};
+    let ch = any contractT ensures {member result g1.activeContracts /\ result.contractStatus = Normal hs.split.condOutput.id} in
+    assert {hs.split.condOutput.id.fundingId = args.fundingId};
+    assert {not (inputUnspent hs.split.condOutput.id g1)};
+    assert {member (Normal hs.split.condOutput.id) g1.allContracts};
+    assert {member hs.split.condOutput.id.expectedContractStatusMoveOwnCoins g1.allContracts};
+    assert {member args.expectedContractStatusMoveOwnCoins g1.allContracts};
+    if not (compareArgs hs.split.condOutput.id args) then (
+        assert {computeActualcontractStatus g2 args = Closed};
+        assert {st};
+    ) else (
+        assert {ch.contractStatus.extractChannelId = Some args};
+        assert {computeActualcontractStatus g1 args = PresentOnGamma ch};
+        assert {computeTimeLimit (computeActualcontractStatus g1 args) t0 = Some (t0 + 2*deltaNet + deltaWake)}; 
+        assert  {t <= t0 + 2*deltaNet + deltaWake};
+        let newChStatus = DisputeOpen hs.split.condOutput in
+        let newCh = {contractStatus = newChStatus; lastContractTransitionTime = t} in
+        assert {args = hs.split.condOutput.id};
+        assert {newCh.contractStatus.extractChannelId = Some args};
+        assert {member newChStatus newMsg.evalOut};
+        assert {member newCh g2.activeContracts};
+        assert {extractChannelByIdFromGamma g2 args = Some newCh};
+        assert {computeActualcontractStatus g2 args = PresentOnGamma newCh};
+        assert {st}; (*unfold progressTrackerMainCase*)
+    )
+| ClaimAfterTimeout (s, _, _)
+| Revoke (s, _, _, _)-> 
+    assert {newMsg.expectedContractStatus = DisputeOpen s};
+    let ch = any contractT ensures {member result g1.activeContracts /\ result.contractStatus = DisputeOpen s} in
+    assert {s.id.fundingId = args.fundingId};
+    assert {member (Normal s.id) g1.allContracts};
+    if not (compareArgs s.id args) then (
+        assert {computeActualcontractStatus g2 args = Closed};
+        assert {st};
+    ) else (
+        assert {forall x. member x newMsg.evalOut -> x.extractChannelId = None};
+        (*assert {forall x. member x g1.activeContracts -> x.contractStatus.extractChannelId = Some args -> x.contractStatus = Normal s.id};*)
+        assert {forall x. member x (removeOne_comp compareSimpleChannel ch g1.activeContracts) -> x.contractStatus.extractChannelId <> Some args};
+        assert {forall x. member x g2.activeContracts -> x.contractStatus.extractChannelId <> Some args};
+        assert {extractChannelByIdFromGamma g2 args = None};
+        assert {computeActualcontractStatus g2 args = Closed};
+        assert {st};
+    )
+| _ -> assert {st};
+end
+
+
+let lemma deliverMsgoToGammaPreservesProgressTracker (system : systemStateT) (msgAndTime : (msgToGammaT, timeT)) (id1 id2 : idT) = 
+requires { closingInvariantFull system }
+requires { num_occ msgAndTime system.msgsToGamma <> 0 }
+requires { id1 <> id2}
+requires { idFreshForGamma system.gamma id1 }
+requires { idFreshForGamma system.gamma id2 } 
+ensures { progressTrackerSys (applyAdversaryMove system (DeliverMsgToGamma msgAndTime (id1, id2))) }
+let newSys = applyAdversaryMove system (DeliverMsgToGamma msgAndTime (id1, id2)) in
+let st = progressTrackerSys newSys in
+let msg = msgAndTime.fst in
+let _msgt = msgAndTime.snd in
+let newMsgs = removeOne_comp compareMsgQueueEntries msgAndTime system.msgsToGamma in
+let msgNewIds = replaceIdsInMsg msg id1 id2 in
+assert {newSys.honestParty = system.honestParty};
+match system.honestParty.getSimpleParty.channelInfo.makeStrict with
+| None -> assert {st}; (*unfold progressTrackerSys; unfold progressTracker*)
+| Some ps -> 
+    let chId = ps.getTracedChannelId in
+    match gammaProcessMsg system.gamma msgNewIds system.systemSignatureState system.time with 
+        | AdversaryError -> assert {st};
+        | CorrectGamma g ->
+            assert {checkFreshness msgNewIds system.gamma};
+            match gammaProcessMsgFresh system.gamma msgNewIds system.systemSignatureState system.time with
+            | None ->
+                assert {g = system.gamma};
+                assert {newSys = {system with msgsToGamma = newMsgs}};
+                gammaProcessMsgNoneSoNonImportant system msgNewIds;
+                assert {progressTrackerSys {system with msgsToGamma = newMsgs}};
+                assert {st};
+            | Some g' ->
+                match system.closeOrderTime with
+                | None -> assert {st};
+                | Some t0 ->
+                    assert {progressTrackerSys system};
+                    assert {system.honestParty.getSimpleParty.channelInfo.getTracedChannelIdGeneral = Some chId};
+                    assert {progressTrackerMainCase system.msgsToGamma system.systemSignatureState system.gamma system.time t0 system.honestPartyLastWoken chId};
+                    if compareIDs msgNewIds.getMsgFunding.fundingId chId.fundingId then (
+                        progressTrackerMainCasePreservedWhenProcessingMatchingIds msgAndTime id1 id2 system.msgsToGamma system.systemSignatureState system.gamma g' system.time t0 system.honestPartyLastWoken chId;
+                        assert {progressTrackerMainCase newMsgs system.systemSignatureState g' system.time t0 system.honestPartyLastWoken chId};
+                        assert {st};
+                    ) else ( 
+                        assert {progressTrackerMainCase (system.msgsToGamma) (system.systemSignatureState) (system.gamma) (system.time) t0 (system.honestPartyLastWoken) chId};
+                        if compareDestinations chId.destination Channel && 0 <= chId.amount <= chId.totalAmount then (
+                        assert {member chId.expectedContractStatusMoveOwnCoins system.gamma.allContracts};
+                        assert {progressTrackerMainCase system.msgsToGamma system.systemSignatureState g' system.time t0 system.honestPartyLastWoken chId};
+                        assert {not (isMsgImportant system msgNewIds)};
+                        assert {not (isMsgImportant system msg)};
+                        skipNonImportantPreservesProgressTracker {system with gamma = g'} msgAndTime;
+                        assert {progressTrackerMainCase newMsgs system.systemSignatureState g' system.time t0 system.honestPartyLastWoken chId};
+                        assert {st};
+                        ) else (
+                          assert {computeActualcontractStatus g' chId = Closed};
+                          assert {st};
+                        )
+                    )
+                   
+                end
+            end
+    end
+end
+
+(*predicate whenCommitedToNotYetOpenedOpenerOnQueue (s : systemStateT) = 
+    match s.honestParty.getSimpleParty.channelInfo.makeStrict with
+    | None -> true
+    | Some ps -> 
+        computeActualcontractStatus s.gamma ps.getTracedChannelId = NotYetOpened -> 
+        (exists msg t. member (msg, t) s.msgsToGamma /\
+            correctChannelOpening ps.getTracedChannelId s.systemSignatureState s.gamma msg)
+    end*)
+
+let lemma notYetOpenedTrichotomy (g : gammaStateT) (args : transferFromPublicKeyAccountT) =
+requires {gammaCoherent g}
+requires {computeActualcontractStatus g args <> NotYetOpened}
+ensures {args.destination <> Channel \/ args.amount > args.totalAmount \/ args.amount < 0 \/ not (inputUnspent args g)}
+match args.destination with
+| Void -> assert {args.destination <> Channel}
+| OtherParty -> assert {args.destination <> Channel}
+| Channel -> 
+    match extractChannelByIdFromGamma g args with
+    | Some ch ->
+        match ch.contractStatus with
+        | Normal f -> 
+            assert {f = args};
+            assert {isSpent args.expectedContractStatusMoveOwnCoins g};
+        | DisputeOpen split -> 
+            assert {split.id = args};
+            assert {isSpent args.expectedContractStatusMoveOwnCoins g};
+        | _ -> absurd
+        end
+    | None -> assert {args.amount > args.totalAmount \/ args.amount < 0 \/ not (inputUnspent args g)}
+    end
+end
+
+let lemma gammaProcessMsgPrserservesSpent (g1 g2 : gammaStateT) (msg : msgToGammaT) (sigs : signatureFunctionalityT) (t : timeT) (ch : contractStatusT) =
+requires {gammaCoherent g1}
+requires {gammaProcessMsg g1 msg sigs t = CorrectGamma g2}
+requires {checkFreshness msg g1}
+requires {isSpent ch g1}
+ensures {isSpent ch g2}
+match gammaProcessMsgFresh g1 msg sigs t with
+| Some g2' -> 
+    assert {g2 = g2'};
+    assert {gammaProcessMsgFresh g1 msg sigs t = Some g2};
+    assert {member ch g1.allContracts};
+    assert {member ch g2.allContracts};
+    assert {not (member ch g1.contractStatuses)};
+    assert {not (member ch msg.evalOut)};
+    assert {not (member ch g2.contractStatuses)};
+    assert {isSpent ch g2}
+| None ->
+    assert {g1 = g2};
+    assert {isSpent ch g1};
+end
+
+let lemma checkFreshnessWhenFreshIds (g : gammaStateT) (msg : msgToGammaT) (id1 id2 : idT) =
+requires {idFreshForGamma g id1}
+requires {idFreshForGamma g id2}
+requires {id1 <> id2}
+ensures {checkFreshness (replaceIdsInMsg msg id1 id2) g}
+let st = checkFreshness (replaceIdsInMsg msg id1 id2) g in
+match msg with
+| OpenDispute (_, _, _) -> assert {st};
+| Revoke (_, _, _, _) -> assert {st};
+| MoveOwnCoinsOnChain (_, _, _, _) -> assert {st};
+| ClaimAfterTimeout (_, _, _) -> assert {st};
+end
+
+
+let lemma correctChannelOpeningIdIndependent (args : transferFromPublicKeyAccountT) (sigs : signatureFunctionalityT) (g : gammaStateT) (msg : msgToGammaT) (id1 id2 : idT) =
+requires {correctChannelOpening args sigs g msg}
+ensures {correctChannelOpening args sigs g (replaceIdsInMsg msg id1 id2)}
+match msg with
+| MoveOwnCoinsOnChain (_, _, _, _) -> assert {correctChannelOpening args sigs g (replaceIdsInMsg msg id1 id2)}
+| _ -> absurd 
+end
+
+let lemma correctChannelOpenerOpens (g1 g2 : gammaStateT) (args : transferFromPublicKeyAccountT) (msg : msgToGammaT) (sigs : signatureFunctionalityT) (t : timeT) =
+requires {gammaCoherent g1}
+requires {gammaCoherent g2}
+requires {checkFreshness msg g1}
+requires {gammaProcessMsgFreshFull g1 msg sigs t = g2}
+requires {computeActualcontractStatus g1 args = NotYetOpened}
+requires {correctChannelOpening args sigs g1 msg}
+ensures {computeActualcontractStatus g2 args <> NotYetOpened}
+if not (compareDestinations args.destination Channel) then assert {computeActualcontractStatus g2 args = Closed} else 
+match msg with 
+| MoveOwnCoinsOnChain (args', sig, _, _) ->
+    assert {args = args'};
+    assert {verify args.sender (SignableTX args) sig sigs};
+    assert {inputPresentOnGamma g1 args};
+    assert { 0 <= args.amount <= args.totalAmount};
+    match gammaProcessMsgFresh g1 msg sigs t with
+    | None ->
+        match filter (fun x -> compareContractStatus x.contractStatus args.expectedContractStatusMoveOwnCoins) g1.activeContracts with
+        | Nil ->
+            assert {forall x . member x g1.activeContracts -> x.contractStatus <> args.expectedContractStatusMoveOwnCoins};
+            assert {forall x . member x g1.contractStatuses -> x <> args.expectedContractStatusMoveOwnCoins};
+            absurd
+        | Cons ch _ -> 
+            assert {ch.contractStatus = args.expectedContractStatusMoveOwnCoins};
+            assert {verificationCheck msg sigs};
+            assert {msgApplicable ch.contractStatus msg};
+            assert {timeCheck msg ch.lastContractTransitionTime t};
+            assert {contractProcessMsg ch msg sigs t = Some msg.evalOut};
+            absurd
+        end
+    | Some g2' -> 
+        assert {g2 = g2'};
+        assert {isSpent args.expectedContractStatusMoveOwnCoins g2};
+        assert {computeActualcontractStatus g2 args <> NotYetOpened};
+    end 
+| _ -> absurd
+end
+
+let lemma allContractsPreservedGammaProcessMsgFresh (g : gammaStateT) (msg : msgToGammaT) (sigs : signatureFunctionalityT) (t : timeT) (ch : contractStatusT) =
+requires {gammaCoherent g}
+requires {member ch g.allContracts}
+ensures {member ch (gammaProcessMsgFreshFull g msg sigs t).allContracts}
+let g2 = gammaProcessMsgFreshFull g msg sigs t in
+match gammaProcessMsgFresh g msg sigs t with
+| None ->
+    assert {g2 = g};
+    assert {member ch g.allContracts}
+| Some g' ->
+    assert {g2 = g'};
+    let chFull = any contractT ensures {member result g.activeContracts /\ result.contractStatus = msg.expectedContractStatus} in
+    gammaProcessMsgFreshSomeSpec g g' msg sigs t chFull;
+    assert {member ch g'.allContracts}
+end
+
+let lemma correctChannelOpeningPreservedWhenNotYetOpened (g1 g2 : gammaStateT) (args : transferFromPublicKeyAccountT) (msg : msgToGammaT) (sigs : signatureFunctionalityT) (t : timeT) (opener : msgToGammaT) =
+requires {gammaCoherent g1}
+requires {gammaProcessMsgFreshFull g1 msg sigs t = g2}
+requires {checkFreshness msg g1}
+requires {computeActualcontractStatus g1 args = NotYetOpened}
+requires {computeActualcontractStatus g2 args = NotYetOpened}
+requires {correctChannelOpening args sigs g1 opener}
+ensures {correctChannelOpening args sigs g2 opener}
+assert {args.destination = Channel};
+assert {0 <= args.amount <= args.totalAmount};
+match opener with
+| MoveOwnCoinsOnChain (args', _, _, _) ->
+    assert {args = args'};
+    assert {correctChannelOpening args sigs g1 opener};
+    assert {inputPresentOnGamma g1 args};
+    assert {member args.expectedContractStatusMoveOwnCoins g1.allContracts};
+    assert {member args.expectedContractStatusMoveOwnCoins g2.allContracts};
+    assert {inputUnspent args g1};
+    assert {inputUnspent args g2};
+    assert {member args.expectedContractStatusMoveOwnCoins g1.contractStatuses};
+    assert {member args.expectedContractStatusMoveOwnCoins g2.contractStatuses};
+    assert {inputPresentOnGamma g2 args}; (*unfold inputPresentOnGamma*)
+    assert {correctChannelOpening args sigs g2 opener};
+| _ -> absurd 
+end
+
+let lemma deliverMsgToGammaPreservesChannelOpeningInvariant (s : systemStateT) (msgAndTime : (msgToGammaT, timeT)) (id1 id2 : idT) =
+requires {closingInvariantFull s}
+requires {member msgAndTime s.msgsToGamma}
+requires {id1 <> id2}
+requires {idFreshForGamma s.gamma id1}
+requires {idFreshForGamma s.gamma id2}
+ensures {whenCommitedToNotYetOpenedOpenerOnQueue (applyAdversaryMove s (DeliverMsgToGamma msgAndTime (id1, id2)))}
+let newSys = applyAdversaryMove s (DeliverMsgToGamma msgAndTime (id1, id2)) in
+let st = whenCommitedToNotYetOpenedOpenerOnQueue newSys in
+let msg = msgAndTime.fst in
+let newMsgs = removeOne msgAndTime s.msgsToGamma in
+let msgNewIds = replaceIdsInMsg msg id1 id2 in
+assert {checkFreshness msgNewIds s.gamma};
+assert {whenCommitedToNotYetOpenedOpenerOnQueue s};
+assert {newSys.gamma = gammaProcessMsgFreshFull s.gamma msgNewIds s.systemSignatureState s.time};
+(*unfold newSys; rewrite applyAdversaryMove'spec*)
+match s.honestParty.getSimpleParty.channelInfo.makeStrict with
+| None -> assert {whenCommitedToNotYetOpenedOpenerOnQueue newSys};
+| Some ps ->
+    let args = ps.getTracedChannelId in
+    match computeActualcontractStatus s.gamma ps.getTracedChannelId with 
+    | NotYetOpened ->
+        if correctChannelOpening args s.systemSignatureState s.gamma msg then (
+            correctChannelOpenerOpens s.gamma newSys.gamma ps.getTracedChannelId msgNewIds s.systemSignatureState s.time;
+            assert {computeActualcontractStatus newSys.gamma ps.getTracedChannelId <> NotYetOpened};
+            assert {st};
+        ) else (
+            match computeActualcontractStatus newSys.gamma ps.getTracedChannelId with
+            | NotYetOpened -> 
+                (*assert {forall msg. correctChannelOpening args s.systemSignatureState s.gamma msg -> correctChannelOpening args s.systemSignatureState newSys.gamma msg};*)
+                assert {exists msg t. member (msg, t) s.msgsToGamma /\ correctChannelOpening ps.getTracedChannelId s.systemSignatureState s.gamma msg};
+                let (opener, ot) = any (msgToGammaT, timeT) ensures {member result s.msgsToGamma /\ correctChannelOpening ps.getTracedChannelId s.systemSignatureState s.gamma result.fst} in
+                assert {opener <> msg};
+                assert {(opener, ot) <> msgAndTime};
+                assert {member (opener, ot) newMsgs};
+                assert {newSys.msgsToGamma = newMsgs}; (*unfold newSys; unfold applyAdversaryMove*)
+                assert {newSys.honestParty = s.honestParty};
+                assert {correctChannelOpening args s.systemSignatureState newSys.gamma opener};
+                assert {st};
+            | _ -> assert {st};
+            end 
+        )
+    | _ -> 
+        assert {computeActualcontractStatus s.gamma ps.getTracedChannelId <> NotYetOpened};
+        assert {args.destination <> Channel || args.amount > args.totalAmount || args.amount < 0 || not (inputUnspent args s.gamma)};
+        if not (equal args.destination Channel) || args.amount > args.totalAmount || args.amount < 0 then (
+            assert {computeActualcontractStatus newSys.gamma args = Closed};
+            assert {st};
+        ) else (
+            assert {not (inputUnspent args s.gamma)};
+            let input = expectedContractStatusMoveOwnCoins args in
+            assert {isSpent input s.gamma};
+            assert {isSpent input newSys.gamma };            
+            assert {not (inputUnspent args newSys.gamma)};
+            assert {computeActualcontractStatus newSys.gamma ps.getTracedChannelId <> NotYetOpened};
+            assert {st};
+        )
+    end
+end
+
+let lemma processDeliverMsgToGammaGamma (s : systemStateT) (msgAndTime : (msgToGammaT, timeT)) (id1 id2 : idT) =
+requires {idFreshForGamma s.gamma id1}
+requires {idFreshForGamma s.gamma id2}
+requires {id1 <> id2}
+requires {member msgAndTime s.msgsToGamma}
+requires {systemStateInvariantSimple s}
+ensures {(applyAdversaryMove s (DeliverMsgToGamma msgAndTime (id1, id2))).gamma = gammaProcessMsgFreshFull s.gamma (replaceIdsInMsg msgAndTime.fst id1 id2) s.systemSignatureState s.time}
+()
+(*split; rewrite applyAdversaryMove'spec*)
+
+let lemma processDeliverMsgToGammaMsgQueue (s : systemStateT) (msgAndTime : (msgToGammaT, timeT)) (id1 id2 : idT) =
+requires {idFreshForGamma s.gamma id1}
+requires {idFreshForGamma s.gamma id2}
+requires {id1 <> id2}
+requires {member msgAndTime s.msgsToGamma}
+requires {systemStateInvariantSimple s}
+ensures {(applyAdversaryMove s (DeliverMsgToGamma msgAndTime (id1, id2))).msgsToGamma = removeOne msgAndTime s.msgsToGamma}
+assert {checkFreshness (replaceIdsInMsg msgAndTime.fst id1 id2) s.gamma}
+(*POST: rewrite applyAdversaryMove'spec*)
+
+let lemma processDeliverMsgToGammaInvariants (s : systemStateT) (msgAndTime : (msgToGammaT, timeT)) (id1 id2 : idT) =
+requires {systemStateInvariantSimple s}
+ensures {(applyAdversaryMove s (DeliverMsgToGamma msgAndTime (id1, id2))).honestParty = s.honestParty}
+ensures {(applyAdversaryMove s (DeliverMsgToGamma msgAndTime (id1, id2))).systemSignatureState = s.systemSignatureState}
+ensures {(applyAdversaryMove s (DeliverMsgToGamma msgAndTime (id1, id2))).time = s.time}
+ensures {(applyAdversaryMove s (DeliverMsgToGamma msgAndTime (id1, id2))).honestPartyLastWoken = s.honestPartyLastWoken}
+ensures {(applyAdversaryMove s (DeliverMsgToGamma msgAndTime (id1, id2))).closeOrderTime = s.closeOrderTime}
+ensures {(applyAdversaryMove s (DeliverMsgToGamma msgAndTime (id1, id2))).expectedAmount = s.expectedAmount}
+()
+
+let lemma deliverMsgToGammaPreservesTimeCoherent (s : systemStateT) (msgAndTime : (msgToGammaT, timeT)) (id1 id2 : idT) =
+requires {closingInvariantFull s}
+requires {idFreshForGamma s.gamma id1}
+requires {idFreshForGamma s.gamma id2}
+requires {id1 <> id2}
+requires {member msgAndTime s.msgsToGamma}
+requires {systemStateInvariantSimple s}
+ensures {timeCoherentForClosing (applyAdversaryMove s (DeliverMsgToGamma msgAndTime (id1, id2)))}
+let newSys = applyAdversaryMove s (DeliverMsgToGamma msgAndTime (id1, id2)) in
+let newMsg = replaceIdsInMsg msgAndTime.fst id1 id2 in
+match gammaProcessMsgFresh s.gamma newMsg s.systemSignatureState s.time with
+| None -> assert {timeCoherentForClosing newSys} (*unfold timeCoherentForClosing*)
+| Some g -> 
+    assert {newSys.time = s.time}; 
+    let chIn = any contractT ensures {member result s.gamma.activeContracts /\ result.contractStatus = newMsg.expectedContractStatus} in
+    assert {gammaProcessMsgFreshFull s.gamma (replaceIdsInMsg msgAndTime.fst id1 id2) s.systemSignatureState s.time = g};
+    gammaProcessMsgFreshSomeSpec s.gamma g newMsg s.systemSignatureState s.time chIn;
+    assert {forall chFull. member chFull newSys.gamma.activeContracts -> member chFull s.gamma.activeContracts \/ chFull.lastContractTransitionTime = s.time};
+    assert {timeCoherentForClosing newSys} (*unfold timeCoherentForClosing*)
+end
+
+let lemma progressTrackerSysMsgtoGammaMonotone (s : systemStateT) (newMsgs : list (msgToGammaT, timeT)) =
+requires {progressTrackerSys s}
+requires {forall msgAndTime. member msgAndTime s.msgsToGamma -> member msgAndTime newMsgs}
+ensures {progressTrackerSys {s with msgsToGamma = newMsgs}}
+match s.closeOrderTime with
+| None -> assert {progressTrackerSys {s with msgsToGamma = newMsgs}}
+| Some t0 -> 
+    match s.honestParty.getSimpleParty.channelInfo.getTracedChannelIdGeneral with
+    | None -> assert {progressTrackerSys {s with msgsToGamma = newMsgs}}
+    | Some args -> 
+        match computeActualcontractStatus s.gamma args with
+        | NotYetOpened -> 
+            assert {progressTrackerMainCase newMsgs s.systemSignatureState s.gamma s.time t0 s.honestPartyLastWoken args};
+        | Closed -> 
+            assert {progressTrackerMainCase newMsgs s.systemSignatureState s.gamma s.time t0 s.honestPartyLastWoken args};
+        | PresentOnGamma ch -> 
+            match ch.contractStatus with
+            | Normal _ -> 
+                assert {  s.honestPartyLastWoken <= ch.lastContractTransitionTime \/ isCorrectDisputeOpeningOnQueue s.msgsToGamma s.systemSignatureState args (t0 + deltaNet + deltaWake) };
+                assert {  s.honestPartyLastWoken <= ch.lastContractTransitionTime \/ isCorrectDisputeOpeningOnQueue newMsgs s.systemSignatureState args (t0 + deltaNet + deltaWake) };
+                assert {progressTrackerMainCase newMsgs s.systemSignatureState s.gamma s.time t0 s.honestPartyLastWoken args};
+            | DisputeOpen split ->
+                assert {  s.honestPartyLastWoken <= (ch.lastContractTransitionTime + channelTimelock) \/ other (split.partyCond) = honestPartySide \/ isCorrectClaimAfterTimeoutOnQueue s.msgsToGamma s.systemSignatureState split (t0 + 2 * deltaNet + 2 * deltaWake + channelTimelock) /\ (ch.lastContractTransitionTime + channelTimelock) <= s.time};
+                assert {  s.honestPartyLastWoken <= (ch.lastContractTransitionTime + channelTimelock) \/ other (split.partyCond) = honestPartySide \/ isCorrectClaimAfterTimeoutOnQueue newMsgs s.systemSignatureState split (t0 + 2 * deltaNet + 2 * deltaWake + channelTimelock) /\ (ch.lastContractTransitionTime + channelTimelock) <= s.time};
+                assert {progressTrackerMainCase newMsgs s.systemSignatureState s.gamma s.time t0 s.honestPartyLastWoken args};
+            | _ -> absurd
+            end
+        end
+    end
+end
+
+let lemma closingInvariantFullMsgMonotone (s : systemStateT) (newMsgs : list (msgToGammaT, timeT)) =
+requires {closingInvariantFull s}
+requires {forall msgAndTime. member msgAndTime s.msgsToGamma -> member msgAndTime newMsgs}
+requires {forall msgAndTime. member msgAndTime newMsgs -> not (member msgAndTime s.msgsToGamma) -> msgAndTime.snd = s.time}
+ensures {closingInvariantFull {s with msgsToGamma = newMsgs}}
+let newSys = {s with msgsToGamma = newMsgs} in
+assert {progressTrackerSys s};
+assert {progressTrackerSys newSys};
+()
+
+predicate sysMsgEquiv (s1 s2 : systemStateT) = 
+s1.honestParty = s2.honestParty /\
+s1.gamma = s2.gamma /\
+s1.systemSignatureState = s2.systemSignatureState /\
+s1.time = s2.time /\
+s1.honestPartyLastWoken = s2.honestPartyLastWoken /\
+s1.closeOrderTime = s2.closeOrderTime /\
+s1.expectedAmount = s2.expectedAmount /\
+forall msgAndTime. member msgAndTime s1.msgsToGamma <-> member msgAndTime s2.msgsToGamma
+
+let lemma closingInvariantSysMsgEquiv (s1 s2 : systemStateT) =
+requires {sysMsgEquiv s1 s2}
+ensures {closingInvariantFull s1 -> closingInvariantFull s2}
+()
+
+let lemma processSendMsgToGammaGamma (s : systemStateT) (msg : msgToGammaT) =
+requires {systemStateInvariantSimple s}
+ensures {(applyAdversaryMove s (SendMsgToGamma msg)).gamma = gammaProcessMsgFreshFull s.gamma msg s.systemSignatureState s.time}
+()
+
+let lemma processSendMsgToGammaInvariants (s : systemStateT) (msg : msgToGammaT) =
+requires {systemStateInvariantSimple s}
+ensures {(applyAdversaryMove s (SendMsgToGamma msg)).honestParty = s.honestParty}
+ensures {(applyAdversaryMove s (SendMsgToGamma msg)).msgsToGamma = s.msgsToGamma}
+ensures {(applyAdversaryMove s (SendMsgToGamma msg)).systemSignatureState = s.systemSignatureState}
+ensures {(applyAdversaryMove s (SendMsgToGamma msg)).time = s.time}
+ensures {(applyAdversaryMove s (SendMsgToGamma msg)).honestPartyLastWoken = s.honestPartyLastWoken}
+ensures {(applyAdversaryMove s (SendMsgToGamma msg)).closeOrderTime = s.closeOrderTime}
+ensures {(applyAdversaryMove s (SendMsgToGamma msg)).expectedAmount = s.expectedAmount}
+()
+
+let lemma checkFreshnessSoExistCorrectIds (g : gammaStateT) (msg : msgToGammaT) =
+requires {checkFreshness msg g}
+ensures {exists id1 id2. idFreshForGamma g id1 /\ idFreshForGamma g id2 /\ id1 <> id2 /\ replaceIdsInMsg msg id1 id2 = msg}
+match msg with 
+| OpenDispute (_, _, id1) 
+| Revoke (_, _, _, id1) 
+| ClaimAfterTimeout (_, _, id1) ->
+     existsFreshId g (Cons id1 Nil);
+    let id2 = any idT ensures {idFreshForGamma g result /\ result <> id1} in
+    assert {replaceIdsInMsg msg id1 id2 = msg};
+    assert {id1 <> id2};
+    assert {idFreshForGamma g id1};
+    assert {idFreshForGamma g id2};
+| MoveOwnCoinsOnChain (x, y, id1, id2) ->
+    assert {replaceIdsInMsg msg id1 id2 = msg};
+    assert { msg.extractIds = Cons id1  (Cons id2 Nil) };
+    assert {checkFreshness (MoveOwnCoinsOnChain (x, y, id1, id2)) g};
+    assert {id1 <> id2}; (*unfold checkFreshness in Assert*)
+    assert {idFreshForGamma g id1};
+    assert {idFreshForGamma g id2};
+end
+
+let lemma partyProcessMsgNewQueueSpec (s : systemStateT) (msg : partyInputT) (msgOnQueue : msgToGammaT) (msgT : timeT) = 
+requires {systemStateInvariantSimple s}
+requires {member (msgOnQueue, msgT) (systemPartyProcessMsg s msg).msgsToGamma}
+ensures {member (msgOnQueue, msgT) s.msgsToGamma \/ msgT = s.time}
+let (_, updateRec) = partyProcessMsg s.honestParty msg s.getSystemView in
+let newSys = systemPartyProcessMsg s msg in
+assert {newSys.msgsToGamma = s.msgsToGamma ++ (map (fun x -> (x, s.time)) updateRec.msgsToSend)};
+assert {member (msgOnQueue, msgT) s.msgsToGamma \/ member (msgOnQueue, msgT) (map (fun x -> (x, s.time)) updateRec.msgsToSend)};
+assert {member (msgOnQueue, msgT) s.msgsToGamma \/ msgT = s.time}
+
+let lemma transferMoneyFromVoidPreservesProgressTracker (s : systemStateT) (amount : amountT) (id : idT) (p : partyT) =
+requires {closingInvariantFull s}
+requires {amount >= 0}
+ensures {progressTrackerSys (applyAdversaryMove s (TransferFromVoid amount p id))}
+let st = progressTrackerSys (applyAdversaryMove s (TransferFromVoid amount p id)) in
+if not (idFreshForGamma s.gamma id) then assert {st} else 
+let newChannel = PublicKeyAccount amount p id in 
+let newChannelFull = {contractStatus = newChannel; lastContractTransitionTime = s.time} in
+let newGamma = {activeContracts = Cons newChannelFull s.gamma.activeContracts; allContracts = Cons newChannel s.gamma.allContracts} in
+assert {applyAdversaryMove s (TransferFromVoid amount p id) = {s with gamma = newGamma}};
+(*let newSys = {s with gamma = newGamma} in*)
+match s.closeOrderTime with
+| None -> assert {st}
+| Some t0 -> 
+    match s.honestParty.getSimpleParty.channelInfo.getTracedChannelIdGeneral with
+    | None -> assert {st}
+    | Some chId ->
+        assert {progressTrackerMainCase s.msgsToGamma s.systemSignatureState s.gamma s.time t0 s.honestPartyLastWoken chId};
+        assert {newChannelFull.contractStatus.extractChannelId = None};
+        assert {extractChannelByIdFromGamma newGamma chId = extractChannelByIdFromGamma s.gamma chId};
+        assert {newChannel.extractAccountId = Some id};
+        assert {member newChannel s.gamma.allContracts -> member id s.gamma.usedIds};
+        assert {member id s.gamma.usedIds -> num_occ_comp compareIDs id s.gamma.usedIds >0};
+        assert {not (member id s.gamma.usedIds)};
+        assert {not (member newChannel s.gamma.allContracts)};
+        assert {forall x. isSpent x s.gamma -> isSpent x newGamma};
+        assert {forall x. isSpent x newGamma -> isSpent x s.gamma};
+        assert {goodFunding s.gamma chId = goodFunding newGamma chId};
+        assert {computeActualcontractStatus newGamma chId = computeActualcontractStatus s.gamma chId};
+        (*assert {progressTrackerMainCase s.msgsToGamma s.systemSignatureState newGamma s.time t0 s.honestPartyLastWoken chId};*)
+        match computeActualcontractStatus s.gamma chId with 
+        | NotYetOpened ->
+          assert {forall x. inputPresentOnGamma s.gamma x -> inputPresentOnGamma newGamma x}; (*unfold inputPresentOnGamma*)
+          assert {forall x. correctChannelOpening chId s.systemSignatureState s.gamma x -> correctChannelOpening chId s.systemSignatureState newGamma x};
+          (*^ unfold correctChannelOpening*)
+          assert {progressTrackerMainCase s.msgsToGamma s.systemSignatureState newGamma s.time t0 s.honestPartyLastWoken chId};
+          assert {st};
+        | Closed -> assert {st};
+        | PresentOnGamma ch -> 
+            match ch.contractStatus with
+            | Normal _ ->
+                assert {progressTrackerMainCase s.msgsToGamma s.systemSignatureState newGamma s.time t0 s.honestPartyLastWoken chId};
+                assert {st};
+            | DisputeOpen _ ->
+                assert {progressTrackerMainCase s.msgsToGamma s.systemSignatureState newGamma s.time t0 s.honestPartyLastWoken chId}; (*unfold progressTrackerMainCase*)
+                assert {st};
+            | _ -> absurd
+            end
+        end
+    end
+end
+
+let lemma transferMoneyFromVoidPreservesOpeningOnQueue (s : systemStateT) (amount : amountT) (id : idT) (p : partyT) =
+requires {closingInvariantFull s}
+ensures {whenCommitedToNotYetOpenedOpenerOnQueue (applyAdversaryMove s (TransferFromVoid amount p id))}
+let st = whenCommitedToNotYetOpenedOpenerOnQueue (applyAdversaryMove s (TransferFromVoid amount p id)) in
+if not (idFreshForGamma s.gamma id) then assert {st} else
+let newChannel = PublicKeyAccount amount p id in
+let newChannelFull = {contractStatus = newChannel; lastContractTransitionTime = s.time} in
+let newGamma = {activeContracts = Cons newChannelFull s.gamma.activeContracts; allContracts = Cons newChannel s.gamma.allContracts} in
+assert {applyAdversaryMove s (TransferFromVoid amount p id) = {s with gamma = newGamma}};
+let newSys = {s with gamma = newGamma} in
+match s.honestParty.getSimpleParty.channelInfo.makeStrict with
+| None -> assert {st}
+| Some ps -> 
+    let chId = ps.getTracedChannelId in
+    assert {newChannelFull.contractStatus.extractChannelId = None};
+    assert {extractChannelByIdFromGamma newGamma chId = extractChannelByIdFromGamma s.gamma chId};
+    assert {newChannel.extractAccountId = Some id};
+    assert {member newChannel s.gamma.allContracts -> member id s.gamma.usedIds};
+    assert {member id s.gamma.usedIds -> num_occ_comp compareIDs id s.gamma.usedIds >0};
+    assert {not (member id s.gamma.usedIds)};
+    assert {not (member newChannel s.gamma.allContracts)};
+    assert {forall x. isSpent x s.gamma -> isSpent x newGamma};
+    assert {forall x. isSpent x newGamma -> isSpent x s.gamma};
+    assert {goodFunding s.gamma chId = goodFunding newGamma chId};
+    assert {computeActualcontractStatus newGamma chId = computeActualcontractStatus s.gamma chId};
+    assert {whenCommitedToNotYetOpenedOpenerOnQueue s};
+    assert {forall x. inputPresentOnGamma s.gamma x -> inputPresentOnGamma newGamma x}; (*unfold inputPresentOnGamma*)
+    assert {forall x. correctChannelOpening chId s.systemSignatureState s.gamma x -> correctChannelOpening chId s.systemSignatureState newGamma x}; (*unfold correctChannelOpening*)
+    match computeActualcontractStatus (newSys.gamma) (getTracedChannelId ps) with 
+    | NotYetOpened -> assert {whenCommitedToNotYetOpenedOpenerOnQueue newSys};
+    | _ -> assert {whenCommitedToNotYetOpenedOpenerOnQueue newSys};
+    end
+end
+
+
+let lemma applyAdversaryMovePreservesInvariant (s : systemStateT) (m : adversaryMoveT) =
+requires { closingInvariantFull s }
+requires { moveApplicable s m }
+ensures { closingInvariantFull (applyAdversaryMove s m) }
+match m with 
+| IncrementTime ->
+    assert {progressTrackerSys (applyAdversaryMove s m)};
+    assert {closingInvariantFull (applyAdversaryMove s m)}; (*unfold closingInvariantFull*)
+| SendMsgToParty msg ->
+  sendMsgToPartyPreservesProgressTracker s msg;
+  sendMsgToPartyPreserveswhenCommitedToNotYetOpenedOpenerOnQueue s msg;
+  let newSys = applyAdversaryMove s (SendMsgToParty msg) in 
+  assert {newSys = applyAdversaryMove s m}; 
+  let (newParty, updateRec) = partyProcessMsg s.honestParty msg s.getSystemView in
+  assert {newParty = newSys.honestParty};
+  assert {goodTransition s.honestParty.getSimpleParty s.getSystemView newParty.getSimpleParty updateRec};
+  assert {goodTransitionForChannel s.honestParty.getSimpleParty.channelInfo s.getSystemView newParty.getSimpleParty.channelInfo updateRec};
+  assert {goodTransitionForClosing s.honestParty.getSimpleParty s.getSystemView newParty.getSimpleParty updateRec};
+  assert {newSys.gamma = s.gamma};
+  assert {newSys.time = s.time};
+  assert {newSys.honestParty.getSimpleParty.simplePartySide = s.honestParty.getSimpleParty.simplePartySide};
+  assert {forall msgAndTime. member msgAndTime newSys.msgsToGamma -> (msgAndTime.snd = s.time \/ member msgAndTime s.msgsToGamma)};
+  assert {timeCoherentForClosing (applyAdversaryMove s m)};
+  assert {whenClosingRequestedThenClosing (applyAdversaryMove s m)};
+  assert {closingInvariantFull (applyAdversaryMove s m)};
+| DeliverMsgToGamma _ (_, _) -> assert {closingInvariantFull (applyAdversaryMove s m)};
+| SignMsg newSigsState ->
+    assert {(applyAdversaryMove s m) = {s with systemSignatureState = newSigsState}};
+    assert {closingInvariantFull (applyAdversaryMove s m)}; (*unfold closingInvariantFull*)
+| Pass -> assert {closingInvariantFull (applyAdversaryMove s m)};
+| SendMsgToGamma msg ->
+    if not (checkFreshness msg s.gamma) then assert {closingInvariantFull (applyAdversaryMove s m)} else 
+    let (id1, id2) = any (idT, idT) ensures {idFreshForGamma s.gamma result.fst /\
+                                             idFreshForGamma s.gamma result.snd /\
+                                             result.fst <> result.snd /\
+                                             replaceIdsInMsg msg result.fst result.snd = msg} in
+    let newMsgs = Cons (msg, s.time) s.msgsToGamma in
+    let s2 = {s with msgsToGamma = newMsgs} in
+    assert {closingInvariantFull s2};
+    assert {moveApplicable s2 (DeliverMsgToGamma (msg, s.time) (id1, id2))};
+    let s3 = applyAdversaryMove s2 (DeliverMsgToGamma (msg, s.time) (id1, id2)) in
+    assert {member (msg, s.time) s2.msgsToGamma};
+    deliverMsgoToGammaPreservesProgressTracker s2 (msg, s.time) id1 id2;
+    assert {closingInvariantFull s3};
+    let s4 = applyAdversaryMove s (SendMsgToGamma msg) in
+    assert {s.gamma = s2.gamma};
+    processDeliverMsgToGammaGamma s2 (msg, s.time) id1 id2;
+    assert {s3.gamma = gammaProcessMsgFreshFull s.gamma msg s.systemSignatureState s.time};
+    assert {sysMsgEquiv s3 s4};
+    assert {closingInvariantFull s4};
+    assert {closingInvariantFull (applyAdversaryMove s m)};
+| TransferFromVoid _amount _p _id -> 
+    assert {closingInvariantFull (applyAdversaryMove s m)}; (*rewrite H; rewrite applyAdversaryMove'spec; assertion (i.e fist branch): unfold closingInvariantFull; split*)
+end
+
+(*Next we show that the closing invariant holds in the initial state*)
+
+let rec lemma applyMovesClosingInvariant (initialState : systemStateT) (moves : list adversaryMoveT) (s : systemStateT) =
+requires {closingInvariantFull initialState}
+(*requires {forall ch. member ch initialGamma.activeContracts -> ch.lastContractTransitionTime <= 0}*)
+requires { applyMoves initialState moves = Some s }
+ensures { closingInvariantFull s }
+variant { moves }
+let st = closingInvariantFull s in 
+match moves with
+| Nil -> assert {st}
+| Cons m ms ->
+    if moveApplicable initialState m then 
+        let next = applyAdversaryMove initialState m in
+        applyAdversaryMovePreservesInvariant initialState m;
+        applyMovesClosingInvariant next ms s;
+        assert {st}
+    else
+        absurd 
+end
+
+(*Finally, we need to show that our invariant holds*)
+let lemma stateReachableSoInvariantHolds (s : systemStateT) =
+requires {stateReachable s}
+ensures {closingInvariantFull s}
+()
+
+let lemma closingWorks (s : systemStateT) (t : timeT) = 
+requires {stateReachable s}
+requires {s.closeOrderTime = Some t}
+requires {t + channelClosingTime <= s.time}
+ensures { immediateAmountOnChain s.gamma honestPartySide >=
+            partyExpectationsFull s.gamma s.systemSignatureState s.honestParty.getSimpleParty.channelInfo s.honestPartyLastWoken s.msgsToGamma}
+()
+
+
+
+end (*ClosingWorkProofs*)
+
+module ProtocolSecureProofs : ProtocolSecureLemmas 
+(*This module follows the Statement-Proof separation convention. See the comment in honestPartyVsAdversary.mlw/ClosingWorksLemmas for more details.*)
+
+use HonestPartyVsAdversary
+use gamma.Evaluator
+use partyInterface.AbstractPartySpec
+use partyInterface.SimplePartyTypes
+use partyInterface.GammaEvaluatorConsistencyChannelLemmas
+use partyInterface.GoodTransition
+use gamma.GammaInvariant
+use gamma.Gamma
+use gamma.EvaluatorEquivalentStatementLemmas
+use gamma.EvaluatorBasicLemmas
+use gamma.GammaInvariantLemmas
+use gamma.Evaluator
+use gamma.EvaluatorAdditionalExportedLemmas
+use gamma.EvaluatorPreservationLemmas
+use basicTypes.BasicTypes
+
+use ClosingWorksLemmas
+use signaturesFunctionality.SignaturesFunctionality
+use listLibrary.ListLibrary
+
+use int.Int
+
+
+(* A simple function, that computes the evaluator function for the honest party *)
+let function systemPartyExpectations (s : systemStateT) : amountT =
+    partyExpectationsFull s.gamma 
+                          s.systemSignatureState 
+                          s.honestParty.getSimpleParty.channelInfo
+                          s.honestPartyLastWoken s.msgsToGamma
+
+predicate timeCoherent (s : systemStateT) =
+    s.honestPartyLastWoken <= s.time /\
+    forall t. s.closeOrderTime = Some t -> t <= s.time 
+    
+
+predicate systemStateInvariant (s : systemStateT) = 
+   s.honestParty.getSimpleParty.simplePartySide = honestPartySide /\
+   timeGuarantee s /\
+   timeCoherent s /\
+   gammaCoherent s.gamma /\
+   partyInvariant s.honestParty s.systemSignatureState /\
+   s.expectedAmount <= s.honestParty.getSimpleParty.balanceTotalExt /\
+   s.honestParty.getSimpleParty.balanceTotal <= s.systemPartyExpectations
+
+let lemma initialStateInvariant (g : gammaStateT) =
+requires {gammaTimeCoherent g 0}
+requires { gammaCoherent g}
+ensures { systemStateInvariant (initialSystemState g) }
+let s = initialSystemState g in
+assert {s.gamma = g};
+assert {s.honestParty = initialPartyState honestPartySide (immediateAmountOnChain g honestPartySide)};
+assert {s.systemSignatureState = emptySignatureState};
+assert {s.time = 0};
+assert {s.honestPartyLastWoken = 0};
+assert {s.msgsToGamma = Nil};
+assert {s.expectedAmount = immediateAmountOnChain g honestPartySide};
+assert {s.closeOrderTime = None};
+let p = (initialPartyState honestPartySide (immediateAmountOnChain g honestPartySide)).getSimpleParty in 
+assert {(immediateAmountOnChain g honestPartySide) >= 0};
+assert {s.honestParty.getSimpleParty = p};
+assert {goodSimpleParty p emptySignatureState};
+assert {p.channelBalanceExt <=  p.channelInfo.makeStrict.balanceOurAGenericOption};
+assert {immediateAmountOnChain g honestPartySide = p.onChainBalance}; 
+assert {s.expectedAmount <= balanceTotalExt p};
+assert {lossesInMoveOwnCoinsMsgsFull (s.gamma) (s.systemSignatureState) (p.channelInfo) (s.honestPartyLastWoken) (s.msgsToGamma) = 0};
+assert {channelBalance p >= 0};
+assert { p.onChainBalance <= moneyInChannelsFull (s.gamma) (s.systemSignatureState) (p.channelInfo) (s.honestPartyLastWoken) (s.msgsToGamma)}; (*finisher *)
+assert { balanceTotal p <= systemPartyExpectations s};
+assert {systemStateInvariant s}
+
+let lemma signMsgMovePreservesInvariant (s : systemStateT) (newSigsState : signatureFunctionalityT) = 
+requires { systemStateInvariant s }
+requires { signatureFunctionalityTransition honestPartySide s.systemSignatureState newSigsState }
+ensures {systemStateInvariant (applyAdversaryMove s (SignMsg newSigsState))}
+let newSys = applyAdversaryMove s (SignMsg newSigsState) in
+let st = systemStateInvariant newSys in
+assert {newSys.systemSignatureState = newSigsState};
+assert {newSys.honestParty = s.honestParty};
+assert {other adversarySide = honestPartySide};
+assert {signatureFunctionalityTransition honestPartySide s.systemSignatureState newSys.systemSignatureState};
+assert {signatureFunctionalityTransition honestPartySide s.systemSignatureState newSys.systemSignatureState};
+partyExpectationsAdversarySigsMonotone s.gamma s.systemSignatureState newSys.systemSignatureState s.honestParty.getSimpleParty.channelInfo s.honestPartyLastWoken s.msgsToGamma (*s.time*);
+assert {newSys.systemPartyExpectations >= s.systemPartyExpectations};
+assert {partyInvariant s.honestParty newSys.systemSignatureState};
+assert {newSys.honestParty = s.honestParty};
+assert {s.honestParty.getSimpleParty.balanceTotal <= systemPartyExpectations s};
+assert {newSys.honestParty.getSimpleParty.balanceTotal <= systemPartyExpectations newSys};
+assert {st}
+
+let lemma replaceIdsWithFreshSoMsgFresh (g : gammaStateT) (msg : msgToGammaT) (id1 : idT) (id2 : idT) =
+requires {id1 <> id2}
+requires {idFreshForGamma g id1}
+requires {idFreshForGamma g id2}
+ensures {checkFreshness (replaceIdsInMsg msg id1 id2) g}
+let st = checkFreshness (replaceIdsInMsg msg id1 id2) g in
+match msg with
+    | OpenDispute (_, _, _) -> assert {st};
+    | ClaimAfterTimeout (_, _, _) -> assert {st};
+    | Revoke (_, _, _, _) -> assert {st};
+    | MoveOwnCoinsOnChain (args, sig, _, _)  ->
+      assert {checkFreshness (MoveOwnCoinsOnChain (args, sig, id1, id2)) g}; (*unfold checkFreshness*)
+      assert {st};
+end
+
+
+let lemma deliverMsgToGammaPreservesInvariant (s : systemStateT) (msg : msgToGammaT) (t : timeT) (id1 : idT) (id2 : idT) =
+requires { systemStateInvariant s }
+requires { moveApplicable s (DeliverMsgToGamma (msg, t) (id1, id2)) }
+ensures { systemStateInvariant (applyAdversaryMove s (DeliverMsgToGamma (msg, t) (id1, id2))) }
+let newMsgs = removeOne (msg, t) s.msgsToGamma in
+let msgNewIds = replaceIdsInMsg msg id1 id2 in
+match gammaProcessMsg s.gamma msgNewIds s.systemSignatureState s.time with
+    | AdversaryError ->
+      assert { checkFreshness msgNewIds s.gamma };
+      absurd
+    | CorrectGamma g ->
+        assert {applyAdversaryMove s (DeliverMsgToGamma (msg, t) (id1, id2)) = {s with gamma = g; msgsToGamma = newMsgs}}; (*rewrite applyAdversaryMove'spec*)
+        let eval1 = partyExpectationsFull s.gamma s.systemSignatureState s.honestParty.getSimpleParty.channelInfo s.honestPartyLastWoken s.msgsToGamma in
+        let shuffledMsgs = Cons (msg, t) newMsgs in
+        let eval2 = partyExpectationsFull s.gamma s.systemSignatureState s.honestParty.getSimpleParty.channelInfo s.honestPartyLastWoken shuffledMsgs in
+        let shuffleMsgsNewId = Cons (msgNewIds, t) newMsgs in
+        let eval3 = partyExpectationsFull s.gamma s.systemSignatureState s.honestParty.getSimpleParty.channelInfo s.honestPartyLastWoken shuffleMsgsNewId in
+        let eval4 = partyExpectationsFull g s.systemSignatureState s.honestParty.getSimpleParty.channelInfo s.honestPartyLastWoken newMsgs in
+        assert {eval1 = eval2};
+        (*partyExpectationsMsgIdInvariant s.gamma s.systemSignatureState s.honestParty.getSimpleParty.channelInfo s.honestPartyLastWoken msgNewIds t newMsgs id1 id2;*)
+        assert {eval2 = eval3}; 
+        (*gammaProcessFreshMsgPreservesEvaluatorGLemma s.gamma msgNewIds s.systemSignatureState s.time s.honestParty.getSimpleParty.channelInfo
+                                                     s.honestPartyLastWoken newMsgs t g;*)
+        assert {eval3 <= eval4};
+        assert {timeGuarantee {s with gamma = g; msgsToGamma = newMsgs}}; (*finisher*)
+        assert { systemStateInvariant {s with gamma = g; msgsToGamma = newMsgs} } (*unfold systemStateInvariant*)
+end
+
+let lemma sendMsgToGammaPreservesInvariant (s : systemStateT) (msg : msgToGammaT) = 
+requires { systemStateInvariant s }
+ensures { systemStateInvariant (applyAdversaryMove s (SendMsgToGamma msg)) }
+let st = systemStateInvariant (applyAdversaryMove s (SendMsgToGamma msg)) in
+match gammaProcessMsg s.gamma msg s.systemSignatureState s.time with
+    | AdversaryError -> assert {st}
+    | CorrectGamma g -> 
+        let eval1 = partyExpectationsFull s.gamma s.systemSignatureState s.honestParty.getSimpleParty.channelInfo s.honestPartyLastWoken s.msgsToGamma in
+        let msgs' = Cons (msg, s.time) s.msgsToGamma in
+        let eval2 = partyExpectationsFull s.gamma s.systemSignatureState s.honestParty.getSimpleParty.channelInfo s.honestPartyLastWoken msgs' in
+        let eval3 = partyExpectationsFull g s.systemSignatureState s.honestParty.getSimpleParty.channelInfo s.honestPartyLastWoken s.msgsToGamma in
+        assert {eval1 <= eval2};
+        assert {eval2 <= eval3};
+        assert { systemStateInvariant {s with gamma = g} };
+        assert {st}
+end
+
+
+let lemma sendMsgToPartyPreservesInvariant (s : systemStateT) (msg : partyInputT) =
+requires { systemStateInvariant s }
+requires { moveApplicable s (SendMsgToParty msg) }
+ensures { systemStateInvariant (applyAdversaryMove s (SendMsgToParty msg)) }
+let newS = systemPartyProcessMsg s msg in 
+let (newParty, _) = partyProcessMsg s.honestParty msg s.getSystemView in
+assert {simplePartySide (getSimpleParty (newS.honestParty)) = honestPartySide}; 
+assert {newS.expectedAmount <= balanceTotalExt (getSimpleParty (newS.honestParty))}; (*unfold newS*)
+assert {newParty.getSimpleParty.balanceTotal <= newS.systemPartyExpectations};
+assert {newS.honestParty.getSimpleParty.balanceTotal <= newS.systemPartyExpectations};
+assert {systemStateInvariant newS } (*unfold systemStateInvariant; split; finisher *)
+
+
+
+let lemma applyAdversaryMovePreservesInvariant (s : systemStateT) (m : adversaryMoveT) =
+requires { systemStateInvariant s }
+requires { moveApplicable s m }
+ensures { systemStateInvariant (applyAdversaryMove s m) }
+let st = systemStateInvariant (applyAdversaryMove s m) in 
+match m with
+| IncrementTime -> assert {st} 
+| SendMsgToParty msg -> sendMsgToPartyPreservesInvariant s msg; assert {st}
+| SendMsgToGamma msg -> sendMsgToGammaPreservesInvariant s msg; assert {st}
+| SignMsg signable -> signMsgMovePreservesInvariant s signable; assert {st}
+| DeliverMsgToGamma (msg, t) (id1, id2) -> deliverMsgToGammaPreservesInvariant s msg t id1 id2; assert {st}
+| TransferFromVoid _amount _p _id -> assert {st}
+| Pass -> assert {st}
+end
+
+let rec lemma applyMovesInvariant (initialState : systemStateT) (moves : list adversaryMoveT) (s : systemStateT) =
+requires {systemStateInvariant initialState}
+requires {applyMoves initialState moves = Some s }
+ensures { systemStateInvariant s }
+variant { moves }
+let st = systemStateInvariant s in 
+match moves with
+| Nil -> assert {st}
+| Cons m ms ->
+    if moveApplicable initialState m then 
+        let next = applyAdversaryMove initialState m in
+        applyAdversaryMovePreservesInvariant initialState m;
+        applyMovesInvariant next ms s;
+        assert {st}
+    else
+        absurd 
+end
+
+let lemma invariantSoExpectedAmountHigh (s : systemStateT) =
+requires { systemStateInvariant s }
+ensures { s.expectedAmount <= partyExpectationsFull s.gamma s.systemSignatureState s.honestParty.getSimpleParty.channelInfo s.honestPartyLastWoken s.msgsToGamma }
+()
+
+let lemma imediateAmountOnChainGeqChannelExpectations (gamma : gammaStateT) (p : partyT) (sigs : signatureFunctionalityT) =
+requires {gammaTimeCoherent gamma 0}
+requires {gammaCoherent gamma}
+ensures {immediatePartyExpectations gamma p sigs <= immediateAmountOnChain gamma p}
+let losses = map (fun x -> immediateTransactionNetLoss p x) (getSignedGoodTransactions gamma sigs p) in
+assert {forall x. goodFunding gamma x -> immediateTransactionNetLoss p x >= 0};
+assert {forall x. member x (getSignedGoodTransactions gamma sigs p) -> immediateTransactionNetLoss p x >= 0};
+assert {forall x. member x losses -> x >= 0};
+sumNonNeg losses;
+assert {immediateLossesInMoveOwnCoinsMsgs gamma sigs p >= 0}
+
+
+let lemma fundsSecurityAux (s : systemStateT) (t : timeT) =
+requires { s.closeOrderTime = Some t }
+requires { s.time >= t + channelClosingTime}
+requires { stateReachable s }
+ensures { immediateAmountOnChain s.gamma honestPartySide >= s.expectedAmount }
+()
+
+
+let lemma protocolSecure (_ : unit) =
+ensures { honestPartyWins }
+ () (*unfold honestPartyWins; unfold adversaryWinningState*)
+
+
+end (*ProtocolSecureProofs*)

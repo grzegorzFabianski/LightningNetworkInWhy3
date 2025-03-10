@@ -1,0 +1,250 @@
+module TwoHonestPartiesVsAdversary 
+
+use basicTypes.BasicTypes
+
+use listLibrary.ListLibrary
+use basicTypes.Compare
+use signaturesFunctionality.SignaturesFunctionality
+
+
+use gamma.Evaluator
+use gamma.GammaInvariant
+use partyInterface.SimplePartyTypes
+use honestPartyInteraction.HonestPartyImplementationSpec
+
+use list.Append
+use list.Nth
+
+use io.StdIO
+use ref.Ref
+
+type systemStateT= {
+    gamma : gammaStateT; 
+    parties : partyT -> partyStateT; 
+    msgsToParties : list (msgToPartyT, partyT, timeT);
+    msgsToGamma : list (msgToGammaT, timeT); (*A queue of messages to gamma (sent by the honest party) *)
+    systemSignatureState : signatureFunctionalityT; 
+    succesfullTransfers : list (partyT, amountT, timeT);
+    time : timeT; (*Current time *)
+}
+
+predicate systemStateInvariantSimple (s : systemStateT) = 
+    gammaCoherent s.gamma /\
+    partyInvariant (s.parties A) s.systemSignatureState /\
+    partyInvariant (s.parties B) s.systemSignatureState
+
+(* The time guarantees that the adversary needs to preserve *)
+let predicate timeGuarantee (s : systemStateT) = 
+    forallL (fun x -> x.snd + deltaNet >= s.time) s.msgsToGamma &&
+    forallL (fun x -> x.trd3 + deltaNet >= s.time) s.msgsToParties
+
+type adversaryMoveT = 
+    | IncrementTime 
+    | DeliverMsgToParty (msgToPartyT, partyT, timeT)
+    | DeliverMsgToGamma (msgToGammaT, timeT) (idT, idT)
+    | SendMsgToPartyFromEnv (msgEnvT, partyT)
+
+let function getSystemView (s : systemStateT) = 
+    { sigState = s.systemSignatureState; 
+     gammaState = s.gamma; 
+     currentTime = s.time; 
+     lastWoken = s.time }
+
+let function systemPartyProcessMsg (system : systemStateT) (reciever : partyT) (msg : partyInputT) : systemStateT=
+requires {systemStateInvariantSimple system}
+ensures {systemStateInvariantSimple result}
+    let p = system.parties reciever in
+    let (newParty, updateRec) = partyProcessMsg p msg system.getSystemView in
+    let newSigState = updateRec.newSigState in
+    let newMsgsToGamma = updateMsgs system.time system.msgsToGamma updateRec in
+    let newMsgsToParties = system.msgsToParties ++ (map (fun x -> (x, other reciever, system.time)) updateRec.msgsToSendToCounterParty) in
+    let newSuccessfullTransfers = system.succesfullTransfers ++
+        if updateRec.moneyReceivedInChannel > 0 then Cons (reciever, updateRec.moneyReceivedInChannel, system.time) Nil else Nil in
+    let newParties (p : partyT) = if compareParties p reciever then newParty else (system.parties p) in
+    {system with parties = newParties;
+                 systemSignatureState = newSigState; 
+                 msgsToGamma = newMsgsToGamma;
+                 msgsToParties = newMsgsToParties;
+                 succesfullTransfers = newSuccessfullTransfers}
+
+let comparePartyQueueEntries (x : (msgToPartyT, partyT, timeT)) (y : (msgToPartyT, partyT, timeT)) : bool = 
+ensures {result <-> x = y}
+    compareMsgToParty (fst3 x) (fst3 x) && compareParties (snd3 x) (snd3 x) &&  (trd3 x) = (trd3 y)
+
+let compareGammaQueueEntries (x : (msgToGammaT, timeT)) (y : (msgToGammaT, timeT)) : bool = 
+ensures {result <-> x = y}
+    compareMsgToGamma (fst x) (fst y) && x.snd = y.snd
+
+let function applyMove (s : systemStateT) (m : adversaryMoveT) = 
+requires {systemStateInvariantSimple s}
+ensures {systemStateInvariantSimple result}
+    match m with
+    | IncrementTime -> {s with time = s.time + 1}
+    | DeliverMsgToGamma (msg, t) (id1, id2) -> 
+        if num_occ_comp compareGammaQueueEntries (msg, t) s.msgsToGamma = 0 then s else
+        let newMsgsToGamma = removeOne_comp compareGammaQueueEntries (msg, t) s.msgsToGamma in 
+        let msg = replaceIdsInMsg msg id1 id2 in
+        match gammaProcessMsg s.gamma msg s.systemSignatureState s.time with 
+        | AdversaryError -> s 
+        | CorrectGamma gamma' -> 
+        {s with gamma = gamma';
+                msgsToGamma = newMsgsToGamma}
+        end
+    | DeliverMsgToParty (msg, p, t) -> 
+        if num_occ_comp comparePartyQueueEntries (msg, p, t) s.msgsToParties = 0 then s else 
+        let newMsgsToParties = removeOne_comp comparePartyQueueEntries (msg, p, t) s.msgsToParties in
+        let s' = {s with msgsToParties = newMsgsToParties} in
+        systemPartyProcessMsg s' p (FromParty msg)
+    | SendMsgToPartyFromEnv (msg, p) -> 
+        systemPartyProcessMsg s p (FromEnv msg)
+    end
+
+let function generateFreshId (gamma : gammaStateT)  (taken : list idT) : idT =
+ensures {not (member result taken) /\ idFreshForGamma gamma result}
+    let taken = gamma.usedIds ++ taken in 
+    let fresh = freshInt taken in 
+    assert {not (member fresh taken)};
+    assert {idFreshForGamma gamma fresh};
+    fresh
+
+let function validMoves (system : systemStateT) = 
+    let incrementMoves = if timeGuarantee {system with time = system.time + 1} then Cons IncrementTime Nil else Nil in
+    let deliverToPartyMoves = map (fun msgpt -> DeliverMsgToParty msgpt) system.msgsToParties in
+    let deliverToGammaMoves = map
+      (fun msgt ->
+        let msg = msgt.fst in 
+        let t = msgt.snd in
+        let id1 = generateFreshId system.gamma Nil in
+        let id2 = generateFreshId system.gamma (Cons id1 Nil) in
+        DeliverMsgToGamma (msg, t) (id1, id2))
+      system.msgsToGamma in
+    incrementMoves ++ deliverToPartyMoves ++ deliverToGammaMoves
+
+let function initialSystemState () : systemStateT= 
+ensures {systemStateInvariantSimple result}
+    let accountA = PublicKeyAccount 100 A 1 in 
+    let accountB = PublicKeyAccount 150 B 2 in 
+    let channelA = {contractStatus = accountA; lastContractTransitionTime = 0} in 
+    let channelB = {contractStatus = accountB; lastContractTransitionTime = 0} in
+    let initialGamma = {activeContracts = Cons channelA (Cons channelB Nil); allContracts = Cons accountA (Cons accountB Nil)} in
+    let initialSigState = emptySignatureState in 
+    let initialPartyA = initialPartyState A 100 in 
+    let initialPartyB = initialPartyState B 150 in
+    let parties = fun p -> if compareParties p A then initialPartyA else initialPartyB in
+    {gamma = initialGamma; 
+     parties = parties; 
+     msgsToParties = Nil;
+     msgsToGamma = Nil; 
+     systemSignatureState = initialSigState; 
+     succesfullTransfers = Nil; 
+     time = 0}
+
+(*Printing Out the System State*)
+
+let printParty (p : partyT) = 
+    match p with
+    | A -> print_string "A"
+    | B -> print_string "B"
+    end 
+
+let printTransferInfo (t : (partyT, amountT, timeT)) = 
+    print_string "Party ";
+    printParty t.fst3;
+    print_string " received ";
+    print_int t.snd3;
+    print_string " at time ";
+    print_int t.trd3
+
+let printOptionTransferInfo (x : option (partyT, amountT, timeT)) = 
+    match x with 
+    | None -> print_string "None"
+    | Some t -> printTransferInfo t
+    end
+
+let printTransferInfos (l : list (partyT, amountT, timeT)) =
+    for i = 0 to length l do
+        printOptionTransferInfo (nth i l);
+        print_string "\n"
+    done
+
+let printAndClearTransferInfos (&s : ref systemStateT) =
+   printTransferInfos s.succesfullTransfers;
+   s <- {s with succesfullTransfers = Nil}
+
+let getAndClearSuccesfullTransfers (&s : ref systemStateT) :  list (partyT, amountT, timeT) =
+   let l = s.succesfullTransfers in
+   s <- {s with succesfullTransfers = Nil};
+   l
+
+
+let applyMoveMut (&s : ref systemStateT) (m : adversaryMoveT) = 
+    let x = applyMove s m in 
+    s <- x
+
+let function msgsToDeliver (s : systemStateT) = 
+    match s.validMoves with
+    | Nil -> false 
+    | Cons IncrementTime Nil -> false 
+    | _ -> true
+    end
+    
+let runAllMsgs (&s : ref systemStateT) =
+diverges 
+    while s.msgsToDeliver do 
+        (*print_string "Running a message\n";*)
+        let x = s.validMoves in
+        (*let i = random_int rand (length x) in *) (* weak test, always deliver first message different then IncrementTime *)
+        let i = 1 in
+        match nth i x with 
+        | None ->
+            print_string ("No valid move found, this is a bug. Breaking.");
+            break 
+        | Some move ->  
+            s <- applyMove s move 
+        end
+    done 
+
+let compareTriple (fa : 'a -> 'a -> bool) (fb : 'b -> 'b -> bool) (fc : 'c -> 'c -> bool) (x y : ('a, 'b, 'c)) : bool =
+  let (xa, xb, xc) = x in
+  let (ya, yb, yc) = y in
+  (fa xa ya) && (fb xb yb) && (fc xc yc)
+
+let compareSuccesfullTransfers (x y : list (partyT, amountT, timeT)) : bool =
+  compareList (compareTriple compareParties compareAmounts compareTimes) x y
+
+let simpleTest (_ : unit) : bool = 
+    let &result = ref true in
+    let &s = ref (initialSystemState ()) in 
+    (*print_string "Intializing randomness\n";
+    print_string "Intializing the system\n";
+    print_string "Experiment initialized\n";
+    print_string "\n"; *)
+    applyMoveMut s (SendMsgToPartyFromEnv (EnvOpenChannel 50 100 1, A));
+    runAllMsgs s;
+    applyMoveMut s (SendMsgToPartyFromEnv (JustCheckGamma, A));
+    runAllMsgs s;
+    (*print_string ("ChannelInitialized (?)\n");*)
+    applyMoveMut s (SendMsgToPartyFromEnv (TransferOnChannel 30, A));
+    runAllMsgs s;
+    (*print_string ("Transferred 30 from A to B (?)\n");*)
+    let info1 = getAndClearSuccesfullTransfers s in
+    result <- result && (compareSuccesfullTransfers info1 (Cons (B, 30, 0) Nil)); 
+    applyMoveMut s (SendMsgToPartyFromEnv (TransferOnChannel 15, B));
+    runAllMsgs s; 
+    (*print_string ("Transferred 15 from B to A (?)\n");*)
+    let info2 = getAndClearSuccesfullTransfers s in
+    result <- result && (compareSuccesfullTransfers info2 (Cons (A, 15, 0) Nil)); 
+    applyMoveMut s (SendMsgToPartyFromEnv (CloseNow, A));
+    runAllMsgs s;
+    (*print_string ("Closed the channel (?)\n"); (*Not really, we might need to still wait for the timeout"*) *)
+    result
+
+let main =
+   if simpleTest () then 0 else 1
+
+(*Cannot run using why3 execute, because it does not support partial function application, test with the following command (it fails):*)
+(* why3 --extra-config=extraConf.conf -L src execute src/twoHonestParties.mlw --rac --use="TwoHonestPartiesVsAdversary" "simpleTest 152" *)
+(*Instead extract to ocaml with the following command:*)
+(* why3 --extra-config=extraConf.conf -L src extract -D ocaml64 twoHonestParties.TwoHonestPartiesVsAdversary.simpleTest --recursive -o test.ml *)
+    
+end (* TwoHonestPartiesVsAdversary *)

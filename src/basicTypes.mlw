@@ -1,0 +1,626 @@
+(*
+  This file defines following modules:
+  -  BasicTypes - definition of basic types used in the project, like type of gamma, party view, etc.
+  - Messages - definition of messages send between parties.
+  - Util - definition of helper functions over options and pairs.
+  - Compare - definition of computational equality checking functions over types from BasicTypes and Split. Makes `=` work.
+*)
+
+module Prelude
+  (* Re-exports lists for easier importing in other files. *)
+  use export int.Int
+  use export option.Option
+  use export list.List
+  use export list.Length
+  use export list.NumOcc
+
+  (* for convenience we also export some generic type aliases *)
+  (* Why3's type aliases are non-strict - they implicitly converts, e.g., `int` to `amountT` and vice versa. They are still useful for readability. *)
+  type signatureT = int
+  type amountT = int
+  
+  type timeT = int
+  type nonceT = int
+
+  (* Lightning network protocol consists of two parties communicating with each other - we call them `A` and `B` *)
+  type partyT = A | B
+
+end (* module Prelude *)
+
+module BasicTypes
+  use export Prelude
+  
+  (* global constants, describing network and activation delays *)
+  (* funds security property is parametrized by these constants *)
+
+  (* delay on message delivery *)
+  let constant deltaNet = any int ensures { result > 0 }
+
+  (* delay on frequency of honest party activations (wake-ups) by environment *)
+  let constant deltaWake = any int ensures { result > 0 }
+
+  (* delay after which a party can reclaim its funds from a commitment transaction. Hard-coded value used by Lightning client. *)
+  (* our security proof assumes that `delay >= deltaWake + deltaNet + 1` *)
+  let constant channelTimelock = any int ensures { result >= deltaWake + deltaNet + 1 }
+
+  (* get identifier of other party *)
+  let function other (a : partyT) : partyT =
+    match a with
+    | A -> B
+    | B -> A
+    end
+
+  (*
+    Identifiers of public-key accounts inside `gamma`.
+    We use two types of identifiers:
+    - public-key accounts are identified using the opaque type `idT`
+    - channel outputs are identified using the content of the transaction that created the channel's multi-sig account (`argsT`).
+      Note that due to these definitions, channels have a constant identifier throughout their lifetime, fixed before `gamma` processes the funding transaction.
+    Refer to `gamma` description (in the paper and gamma.mlw) for more details.
+  *)
+  type idT = int
+  let constant placeholderId : idT = -1
+  
+  (*
+    A transaction that spends a public-key account can have one of three types:
+    - `OtherParty`: Payment to counter-party with a pay-to-public-key output,
+    - `Channel`: Transfer to multi-sig account used to open the channel,
+    - `Void`: Untracked account, representing other types of outputs not explicitly modeled here.
+  *)
+  type destinationT = OtherParty | Channel | Void
+
+  (* representation of a transaction that spends a public-key account *)
+  type transferFromPublicKeyAccountT = {
+    sender : partyT; (* identity of owner of source account *)
+    amount : amountT; (* amount transferred to destination *)
+    totalAmount : amountT; (* amount in source account. The rest (`totalAmount - amount`) is paid back to `sender` *)
+    destination : destinationT;
+    fundingId : idT; (* source account id *)
+  } (* intentionally does not contain signature *)
+
+  let predicate transferFromPublicKeyAccountCorrect (args : transferFromPublicKeyAccountT) =
+    args.amount >= 0 && args.totalAmount >= args.amount
+
+  (* conditional output of a commitment transaction *)
+  type conditionalOutputT = {
+    partyCond : partyT; (* "conditional" party: it will not get money in case of revocation *)
+    amountCond : amountT; (* balance of conditional party *)
+    nonce : nonceT; (* used to distinguish commitment transactions (even if they transfer the same amount) *)
+    id : transferFromPublicKeyAccountT; (* identifies channel *)
+  }
+
+  (* type defining both outputs (conditional and unconditional) of commitment transaction.
+  Technically isomorphic to conditionalOutputT, but logically different. amountUnCond is defined only on splitT.
+  The conditionalOutputT should be used when only amountCond is needed *)
+  type splitT = {
+    condOutput : conditionalOutputT;
+  }
+
+  let function channelCapacity (s : conditionalOutputT) : amountT = 
+    s.id.amount
+
+  let function amountUnCond (s : splitT) : amountT =
+    s.condOutput.channelCapacity - s.condOutput.amountCond
+
+  (* list of revoked splits, kept by the party *)
+  type revokedSplitsListT = list (signatureT, conditionalOutputT)
+
+  (* commitment transaction signed by the unconditional party. Used for splits when we are conditional side. *)
+  type halfSignedSplitT = {
+    split : splitT;
+    sigUnCond : signatureT;
+  }
+
+  let predicate goodConditionalOutput (s : conditionalOutputT) =
+    s.id.totalAmount >= 0 &&
+    s.channelCapacity >= 0 &&
+    s.amountCond >= 0
+
+  let predicate goodSplit (s : splitT) =
+    s.condOutput.amountCond >= 0 &&
+    s.condOutput.channelCapacity >= s.condOutput.amountCond &&
+    s.condOutput.id.totalAmount >= 0
+
+  (* The type of contracts used by gamma *)
+  type contractStatusT =
+  | Normal transferFromPublicKeyAccountT (* multi-sig account, only total balance is visible on-chain. Used for opened channel. *)
+  | DisputeOpen conditionalOutputT (* state after commitment transaction is processed by gamma. Used for channel which is closing (the resolution of its conditional output is pending). *)
+  | PublicKeyAccount amountT partyT idT (*public-key account, owned by a single party. Used for coins outside channels.  *)
+  
+  predicate goodStatus (status : contractStatusT) =
+  match status with
+     | PublicKeyAccount amount _ _ -> amount >= 0
+     | Normal args -> transferFromPublicKeyAccountCorrect args
+     | DisputeOpen mSplit -> goodConditionalOutput mSplit
+  end
+
+  let function isPublicKeyAccount (ch : contractStatusT) =
+  match ch with
+  | PublicKeyAccount _ _ _  -> true
+  | _ -> false
+  end
+
+  let function isNormalChannel (ch : contractStatusT) =
+  match ch with
+  | Normal _ -> true
+  | _ -> false
+  end
+
+  let function isDisputeOpen (ch : contractStatusT) =
+  match ch with
+  | DisputeOpen _ -> true
+  | _ -> false
+  end
+
+  (* contract and time of its last update *)
+  (* The time of last update is used to derive the timelock of the conditional output of the commitment transaction. *)
+  (* After this timelock expires, the punishment window of the unconditional party is over and the conditional party can spend the output. *)
+  type contractT = {
+    contractStatus : contractStatusT;
+    lastContractTransitionTime : timeT;
+  }
+ 
+  (*type of the state of gamma*)
+  type gammaStateT = {
+    activeContracts : list contractT; (* list of currently active contracts along with their last activation time  *)
+    allContracts : list contractStatusT; (* list of all contracts, both currently active and deactivated *)
+  }
+
+  (* Equality of gammaStates is equality of their contents *)
+  lemma gammaStateTExt : forall g1 g2.
+    g1.activeContracts = g2.activeContracts ->
+    g1.allContracts = g2.allContracts ->
+    g1 = g2
+
+  (* message from party to gamma *)
+  type msgToGammaT =
+  (* commitment transaction: turns Normal channel into DisputeOpen. Describes conditional output *)
+  | OpenDispute (
+    halfSignedSplitT, (* transaction content *)
+    signatureT, (* signature by conditional party *)
+    idT (* the id of unconditional output of commitment transaction, i.e., a public-key contract *)
+  )
+  (* closes DisputeOpen after channelTimelock without revocation. Issued by conditional party *)
+  | ClaimAfterTimeout (
+    conditionalOutputT, (* identifier of output to be spent *)
+    signatureT, (* signature by conditional party (spender) *)
+    idT (* id where the funds will go (into PublicKeyAccount with conditional party's public key) *)
+  )
+  (* closes DisputeOpen with revocation. Issued by unconditional party if conditional party cheated *)
+  | Revoke (
+    conditionalOutputT, (* output to be spent *)
+    signatureT, (* signature by unconditional party (spender) *)
+    signatureT, (* "revocation" signature by conditional party (cheater) *)
+    idT (* id where the funds will go (into PublicKeyAccount with  unconditional party's public key) *)
+    )
+  (* spends funds in public-key contract *)
+  | MoveOwnCoinsOnChain (
+      transferFromPublicKeyAccountT, (* transaction content *)
+      signatureT, (* signature by spender *)
+      idT, (* id where the change funds will go (into PublicKeyAccount with sender's public key) *)
+      idT (* id where the payment will go. Used when destination is OtherParty. *)
+      )
+
+  (* messages from one party to another *)
+  type msgToPartyT =
+
+  (* channel opening messages start *)
+  (* funder proposes to fundee opening a channel with the amount given *)
+  (* simplification of `open_channel` (https://github.com/lightning/bolts/blob/master/02-peer-protocol.md#the-open_channel-message) *)
+  | OpenChannel amountT
+
+  (* fundee accepts opening a channel with the amount given *)
+  (* simplification of `accept_channel` (https://github.com/lightning/bolts/blob/master/02-peer-protocol.md#the-accept_channel-message) *)
+  | AcceptChannel amountT
+
+  (* funder sends signed funding tx to fundee *)
+  (* corresponds to `funding_created` (https://github.com/lightning/bolts/blob/master/02-peer-protocol.md#the-funding_created-message) but includes whole funding tx, not just its id and funding output index *)
+  | FundingCreated transferFromPublicKeyAccountT halfSignedSplitT
+
+  (* fundee sends signature on first commitment tx *)
+  (* corresponds to `funding_signed` (https://github.com/lightning/bolts/blob/master/02-peer-protocol.md#the-funding_signed-message) *)
+  | CommitmentSigned halfSignedSplitT
+
+  (* funder confirms channel is ready to fundee *)
+  (* corresponds to `channel_ready` (https://github.com/lightning/bolts/blob/master/02-peer-protocol.md#the-channel_ready-message) by funder *)
+  | ChannelReadyByFunder
+
+  (* fundee confirms channel is ready to funder *)
+  (* corresponds to `channel_ready` (https://github.com/lightning/bolts/blob/master/02-peer-protocol.md#the-channel_ready-message) by fundee *)
+  | ChannelReadyByFundee
+  (* channel opening messages end *)
+
+  (* in-channel payment messages start *)
+  (* payer starts new payment *)
+  (* corresponds loosely to a pair of `update_add_htlc` (https://github.com/lightning/bolts/blob/master/02-peer-protocol.md#adding-an-htlc-update_add_htlc) and `update_fulfill_htlc` (https://github.com/lightning/bolts/blob/master/02-peer-protocol.md#removing-an-htlc-update_fulfill_htlc-update_fail_htlc-and-update_fail_malformed_htlc). Note that HTLCs are not explicitly modeled in this work. *)
+  | Initializer (nonceT, amountT)
+
+  (* payee sends signature on new commitment tx *)
+  (* corresponds to `commitment_signed` (https://github.com/lightning/bolts/blob/master/02-peer-protocol.md#committing-updates-so-far-commitment_signed) by payee *)
+  | Commit (nonceT, halfSignedSplitT)
+
+  (* payer sends signature on new and revocation of old commitment tx *)
+  (* corresponds to the combination of `commitment_signed` (https://github.com/lightning/bolts/blob/master/02-peer-protocol.md#committing-updates-so-far-commitment_signed) and `revoke_and_ack` (https://github.com/lightning/bolts/blob/master/02-peer-protocol.md#completing-the-transition-to-the-updated-state-revoke_and_ack), both by payer *)
+  | CommitAndRevokeAndAck (halfSignedSplitT, signatureT)
+
+  (* payee sends revocation of old commitment tx *)
+  (* corresponds to `revoke_and_ack` (https://github.com/lightning/bolts/blob/master/02-peer-protocol.md#completing-the-transition-to-the-updated-state-revoke_and_ack) by payee *)
+  | RevokeAndAck signatureT
+  (* in-channel payment messages end *)
+
+  type msgEnvT =
+  | JustCheckGamma (* environment only wakes party, without further instruction *)
+  | EnvOpenChannel amountT amountT idT (* amount of created channel, amount in account used to open id, id of account used to open it *)
+  | TransferOnChain amountT contractT (*order to transfer amount to counterparty on-chain, using contractT as input *)
+  | TransferOnChannel amountT (*order to transfer amountT inside channel *)
+  | CloseNow (*order to initiate channel closure *)
+
+  (* network messages *)
+  (*type of party inputs, with annotation of source: countrparty or environment *)
+  type partyInputT = FromParty msgToPartyT | FromEnv msgEnvT
+
+  (* type of signed messages.
+  Different variants correspond to domain separation*)
+  type signableT =
+  | SignableSplit splitT (*signing split *)
+  | SignableRevoke conditionalOutputT (*signing revocations *)
+  | SignableClosure conditionalOutputT (*signing ClaimAfterTimeout *)
+  | SignableTX transferFromPublicKeyAccountT (* signing MoveOwnCoinsOnChain data *)
+
+  (*This function says how much money is the party allowed to lose/spent on chain after receiving the message *)
+  let function allowedOnChainLoss (msg : partyInputT) : amountT =
+  match msg with
+  | FromEnv (TransferOnChain amount _) ->
+    if amount >= 0 then
+        amount
+      else
+        0
+  | _ -> 0
+  end
+
+  (*This function says how much money is the party allowed to lose/spent on channel after receiving the message *)
+  let function allowedOnChannelLoss (msg : partyInputT) : amountT =
+  match msg with
+  | FromEnv (TransferOnChannel amount) ->
+    if amount >= 0 then
+        amount
+      else
+        0
+  | _ -> 0
+  end
+
+  (*This function says how much money is the party allowed to lose/spent after receiving the message *)
+  let function allowedTotalLoss (msg : partyInputT) : amountT =
+    allowedOnChainLoss msg + allowedOnChannelLoss msg
+
+  let predicate isCloseOrder (msg : partyInputT) =
+  match msg with
+  | FromEnv CloseNow -> true
+  | _ -> false
+  end
+
+  (* types used to define simplePartyType - type of the party interface *)
+
+  (* Data about channel, hold by simplified party.
+  Such party might not have an active channel - this corresponds to bestSplitReceivedG being None. *)
+  type partySplitsAndRevocationsRecordGeneralT = {
+    recordOwnerG : partyT; (*our side *)
+    bestSplitReceivedG : option halfSignedSplitT; (* most current halfSignedSplitT that the party can use to close the channel *)
+    receivedRevocationsG : revokedSplitsListT; (* list of revocations that party holds *)
+  }
+
+  (* Represents a party with an active channel. *)
+  (* Helper to partySplitsAndRevocationsRecordGeneralT. *)
+  type partySplitsAndRevocationsRecordStrictT = {
+    recordOwner : partyT;
+    bestSplitReceived : halfSignedSplitT;
+    receivedRevocations : revokedSplitsListT;
+  }
+
+  (* try to convert partySplitsAndRevocationsRecordGeneralT to Strict version  *)
+  let function makeStrict (pg : partySplitsAndRevocationsRecordGeneralT) : option partySplitsAndRevocationsRecordStrictT =
+    match pg.bestSplitReceivedG with
+    | Some x ->
+     Some { recordOwner = pg.recordOwnerG;
+       bestSplitReceived = x;
+       receivedRevocations = pg.receivedRevocationsG}
+    | None -> None
+    end
+
+  (* inclusion of partySplitsAndRevocationsRecordStrictT inside partySplitsAndRevocationsRecordGeneralT *)
+  let function makeGeneral (p : partySplitsAndRevocationsRecordStrictT) : partySplitsAndRevocationsRecordGeneralT =
+  {recordOwnerG = p.recordOwner;
+   bestSplitReceivedG = Some p.bestSplitReceived;
+   receivedRevocationsG = p.receivedRevocations}
+
+  let function getTracedChannelIdInner (bestSplit : halfSignedSplitT) : transferFromPublicKeyAccountT =
+    bestSplit.split.condOutput.id
+
+  let function getTracedChannelId (p : partySplitsAndRevocationsRecordStrictT) : transferFromPublicKeyAccountT =
+    p.bestSplitReceived.split.condOutput.id
+
+  let function getTracedChannelIdGeneral (p : partySplitsAndRevocationsRecordGeneralT) : option transferFromPublicKeyAccountT =
+    match p.bestSplitReceivedG with
+    | Some x -> Some x.split.condOutput.id
+    | None -> None
+    end
+
+  let predicate tracksAChannel (p : partySplitsAndRevocationsRecordGeneralT) =
+    match p.bestSplitReceivedG with
+    | Some _ -> true
+    | None -> false
+    end
+
+  (* get balance in channel *)
+  let function balanceOurAStrict (p : partySplitsAndRevocationsRecordStrictT) =
+    p.bestSplitReceived.split.condOutput.amountCond
+
+  (* get balance in channel, zero if no channel *)
+  let function balanceOurAGenericOption (op : option partySplitsAndRevocationsRecordStrictT) : amountT =
+    match op with
+    | None -> 0
+    | Some p -> balanceOurAStrict p
+    end
+
+  let function balanceOurAGeneric (pgG : partySplitsAndRevocationsRecordGeneralT) =
+    balanceOurAGenericOption pgG.makeStrict
+
+  (* get balance in channel, None if no channel *)
+  let function balanceOurAGeneralOrNone (pg : partySplitsAndRevocationsRecordGeneralT) =
+  match pg.bestSplitReceivedG with
+   | None -> None
+   | Some s -> Some s.split.condOutput.amountCond
+  end
+end (* module BasicTypes *)
+
+module BasicLemmasAndProofs
+  use BasicTypes
+
+  let lemma otherNeq (x : partyT) =
+  ensures {other x <> x}
+  match x with
+  | A -> assert {other x <> x};
+  | B -> assert {other x <> x};
+  end
+end (* module BasicLemmasAndProofs *)
+
+(*non Lightning network related function
+  mostly operations on pairs, triples, options (monadic operators), etc. *)
+module Util
+
+  use option.Option
+
+  let function fst (x : ('a, 'b)) : 'a =
+    let (a, _) = x in
+    a
+
+  let function snd (x : ('a, 'b)) : 'b =
+    let (_, b) = x in
+    b
+
+  let function fst3 t =
+    let (x, _, _) = t in x
+
+  let function snd3 t =
+    let (_, x, _) = t in x
+
+  let function trd3 t =
+    let (_, _, x) = t in x
+
+  let predicate isSome (o : option 'a) =
+    match o with None -> false | Some _ -> true end
+
+  let predicate isNone (o : option 'a) =
+    match o with None -> true | Some _ -> false end
+
+  let function maybe (x : option 'a) (y : 'a) =
+    match x with
+    | Some x -> x
+    | None -> y
+    end
+
+  let function unpackOption (o : option 'a) : 'a=
+  requires { isSome o}
+    match o with
+    | Some x -> x
+    | None -> absurd
+    end
+
+  let function (>>=) (a : option 'a) (f : 'a -> option 'b) : option 'b =
+    match a with
+    | None -> None
+    | Some x -> f x
+    end
+
+  let function (<&>) (a : option 'a) (f : 'a -> 'b) : option 'b =
+    match a with
+    | None -> None
+    | Some x -> Some (f x)
+    end
+
+  let function (<$>) (f : 'a -> 'b) (a : option 'a) : option 'b =
+    a <&> f
+
+  let function option2 (f : 'a -> 'a -> 'b) : (option 'a -> option 'a -> option 'b) =
+    fun (x y : option 'a) ->
+      x >>= (fun xp ->
+      y >>= (fun yp ->
+      Some (f xp yp)))
+
+  let function optionAnd (x y : option bool) : option bool =
+    x >>= (fun xp ->
+    y >>= (fun yp ->
+      Some (xp && yp) ))
+
+  let function optionOr (x y : option bool) : option bool =
+    x >>= (fun xp ->
+    y >>= (fun yp ->
+      Some (xp || yp) ))
+
+  (* auxiliary predicate to specify comparison functions. Such function are defined in `Compare` module. *)
+  (* `isCompare` is defined here, so it can be used by listLibrary *)
+  predicate isCompare (f : 'a -> 'a -> bool) = forall x y. (f x y) <-> (x=y)
+  lemma compareFromInner : forall f : 'a -> 'a -> bool. (forall x y. (f x y) <-> x = y) -> isCompare f  
+
+end (*Util*)
+
+(* this module defines compare predicates for types from BasicTypes and Messages *)
+(* why3 doesn't have a derive macro for them *)
+module Compare
+  use Util
+  use BasicTypes
+  
+  let predicate compareInt ( x y : int) =
+  ensures { result <-> x = y }
+    (=) x y
+
+  let function compareNonces x y = compareInt x y
+
+  let function compareTimes (x y: timeT) : bool =
+    ensures { result <-> x = y }
+    x = y
+
+  let function compareAmounts (x y: amountT) : bool =
+    ensures { result <-> x = y }
+    x = y
+
+  let function compareSigs (x y: signatureT) : bool =
+    ensures { result <-> x = y }
+    x = y
+  
+  (*we assume that idT's could be compared *)
+  let function compareIDs (x y: idT) : bool =
+  ensures { result <-> x = y }
+    x = y
+
+  (*for polymorphic types, we need to take compare for inner type *)
+  let predicate compareOption (inner : ('a -> 'a -> bool)) (x y : option 'a) =
+  requires { isCompare inner }
+  ensures { result <-> x = y }
+    match x, y with
+    | None, None -> true
+    | Some xi, Some yi ->
+      inner xi yi
+    | _ -> false
+    end
+
+  let function compareInts (x y: int) : bool =
+    ensures { result <-> x = y }
+    x = y
+
+  let rec predicate compareList (inner : 'a -> 'a -> bool) (x y : list 'a) =
+    requires { forall x y. (x=y) <-> inner x y }
+    ensures { result <-> (x=y) }
+    variant { x }
+    match x, y with
+    | Nil, Nil-> true
+    | Cons xhd xtl, Cons yhd ytl ->
+      inner xhd yhd &&
+      compareList inner xtl ytl
+    | _ -> false
+    end
+
+  let function compareParties (x y: partyT) : bool =
+    ensures { result <-> x = y }
+    match x, y with
+    | A, A -> true
+    | B, B -> true
+    | _, _ -> false
+    end
+
+  let function compareDestinations (x y: destinationT) : bool =
+    ensures { result <-> x = y }
+    match x, y with
+    | OtherParty, OtherParty -> true
+    | Channel, Channel -> true
+    | Void, Void -> true
+    | _, _ -> false
+    end
+
+  let function compareArgs (x y: transferFromPublicKeyAccountT) : bool =
+    ensures { result <-> x = y }
+      compareParties x.sender y.sender
+      && compareAmounts x.amount y.amount
+      && compareAmounts x.totalAmount y.totalAmount
+      && compareDestinations x.destination y.destination
+      && compareIDs x.fundingId y.fundingId
+
+  let function compareConditionalOutputs (x y: conditionalOutputT) : bool =
+    ensures { result <-> x = y }
+      compareParties x.partyCond y.partyCond
+      && compareAmounts x.amountCond y.amountCond
+      && compareNonces x.nonce y.nonce
+      && compareArgs x.id y.id
+
+  let function compareSplits (x y: splitT) : bool =
+    ensures { result <-> x = y }
+    compareConditionalOutputs x.condOutput y.condOutput
+
+  let function compareHsSplits (x y: halfSignedSplitT) : bool =
+    ensures { result <-> x = y }
+    compareSplits x.split y.split && compareSigs x.sigUnCond y.sigUnCond
+
+  let function compareContractStatus (x y: contractStatusT) : bool =
+    ensures { result <-> x = y }
+    match x, y with
+    | Normal xArgs, Normal yArgs -> compareArgs xArgs yArgs
+    | DisputeOpen xConditionalOutput, DisputeOpen yConditionalOutput -> compareConditionalOutputs xConditionalOutput yConditionalOutput
+    | PublicKeyAccount xAmount xParty xid, PublicKeyAccount yAmount yParty yid ->
+      compareAmounts xAmount yAmount && compareParties xParty yParty && compareIDs xid yid
+    | _, _ -> false
+    end
+
+  let function compareSimpleChannel (x y: contractT) : bool =
+    ensures { result <-> x = y }
+    compareContractStatus x.contractStatus y.contractStatus
+    && compareTimes x.lastContractTransitionTime y.lastContractTransitionTime
+
+  let function compareMsgToGamma (x y: msgToGammaT) : bool =
+    ensures { result <-> x = y }
+    match x, y with
+    | OpenDispute (xHsSplit, xSig, xid), OpenDispute (yHsSplit, ySig, yid) ->
+      compareHsSplits xHsSplit yHsSplit && compareSigs xSig ySig && compareIDs xid yid
+    | ClaimAfterTimeout (xconditionalOutputT, xSig, xid), ClaimAfterTimeout (yconditionalOutputT, ySig, yid) ->
+      compareConditionalOutputs xconditionalOutputT yconditionalOutputT && compareSigs xSig ySig && compareIDs xid yid
+    | Revoke (xconditionalOutputT, xSig1, xSig2, xid), Revoke (yconditionalOutputT, ySig1, ySig2, yid) ->
+      compareConditionalOutputs xconditionalOutputT yconditionalOutputT && compareSigs xSig1 ySig1 && compareSigs xSig2 ySig2 && compareIDs xid yid
+    | MoveOwnCoinsOnChain (xArgs, xSig, xid1, xid2), MoveOwnCoinsOnChain (yArgs, ySig, yid1, yid2) ->
+      compareArgs xArgs yArgs && compareSigs xSig ySig && compareIDs xid1 yid1 && compareIDs xid2 yid2
+    | _, _ -> false
+    end
+
+  let function compareMsgQueueEntries (x y : (msgToGammaT, int)) : bool =
+  ensures {result <-> x = y}
+    compareMsgToGamma x.fst y.fst &&
+    x.snd = y.snd
+
+let function compareMsgToParty (x y : msgToPartyT) =
+ensures { result <-> x = y }
+match x, y with
+| OpenChannel x1, OpenChannel y1 -> x1 = y1
+| AcceptChannel x1, AcceptChannel y1 -> x1 = y1
+| FundingCreated x1 x2, FundingCreated y1 y2 -> compareArgs x1 y1 && compareHsSplits x2 y2
+| CommitmentSigned x1, CommitmentSigned y1 -> compareHsSplits x1 y1
+| ChannelReadyByFunder, ChannelReadyByFunder -> true
+| ChannelReadyByFundee, ChannelReadyByFundee -> true
+| Initializer (xNonce, xAmount), Initializer (yNonce, yAmount) ->
+      compareNonces xNonce yNonce && compareAmounts xAmount yAmount
+| Commit (xNonce, xHsSplit), Commit (yNonce, yHsSplit) ->
+      compareNonces xNonce yNonce && compareHsSplits xHsSplit yHsSplit
+| CommitAndRevokeAndAck (xHsSplit, xSig), CommitAndRevokeAndAck (yHsSplit, ySig) ->
+      compareHsSplits xHsSplit yHsSplit && compareSigs xSig ySig
+| RevokeAndAck xSig, RevokeAndAck ySig -> compareSigs xSig ySig
+| _, _ -> false
+end
+
+  let function compareSignables (x y: signableT) : bool =
+    ensures { result <-> x = y }
+    match x, y with
+    | SignableSplit xSplit, SignableSplit ySplit -> compareSplits xSplit ySplit
+    | SignableRevoke xConditionalOutput, SignableRevoke yConditionalOutput -> compareConditionalOutputs xConditionalOutput yConditionalOutput
+    | SignableClosure xConditionalOutput, SignableClosure yConditionalOutput -> compareConditionalOutputs xConditionalOutput yConditionalOutput
+    | SignableTX xArgs, SignableTX yArgs -> compareArgs xArgs yArgs
+    | _, _ -> false
+    end
+
+end (* module Compare *)

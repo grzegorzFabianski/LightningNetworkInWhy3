@@ -1,0 +1,1872 @@
+(* The main goal of this file is to provide the abstract specification of a Lightning node.
+   We define this specification in the module `AbstractPartySpec`. Before that,
+   we introduce several modules to define the types used in the specification,
+   along with a collection of functions and predicates that operate on those types.
+   
+  Specifically, this file consists of the following modules:
+
+  1) `SimplePartyTypes` -- this module defines the following types: `simplePartyT`, `partySystemView`, `updateRecT`. 
+  It also defines a number of basic functions operating on those types.
+
+  2) `SimplePartyEvaluator` -- this module defines a function `totalEvaluatorMinusTotalBalance`,
+  which is used to calculate the surplus of funds in the channel. 
+  In the security experiment, we show that this surplus is always non-negative.
+
+  3) `GoodSplitsAndRevocationsRecord` -- this module defines the predicate `goodSplitsAndRevocationsRecord`,
+  which identifies the necessary properties of the `partySplitsAndRevocationsRecordStrictT` type.
+
+  4) `GoodTransitionChannel` -- this module defines the predicate `goodTransitionForChannel`. 
+  It contains the necessary properties of the `simplePartyT` transition that guarantee the security of funds in the channel.
+
+  5) `GoodTransitionClosing` -- this module defines the predicate `goodTransitionForClosing`.
+  It contains the necessary properties of the `simplePartyT` transition that guarantee the timely closure of the channel.
+
+  6) `GoodTransition` -- this module defines the predicate `goodTransition`,
+  which combines the properties of `goodTransitionForChannel` and `goodTransitionForClosing` with new properties:
+    a) `goodTransitionForChain`, which guarantees correct handling of the on-chain funds.
+    b) `goodTransitionAccounting`, which ensures that the internal bookkeeping of the party is consistent.
+  It also defines the predicate `goodSimpleParty`, which specifies the necessary static properties of the `simplePartyT` type.
+  Predicates `goodSimpleParty` and `goodTransition` are crucial in the abstract specification of the Lightning node.
+
+  7) `AbstractPartySpec` -- this is the main module of this file. It defines an abstract specification of
+  a Lightning node, which guarantees the security of the funds (see `honestPartyVsAdversary.mlw`). 
+  It specifies both the functions that the node should implement and the properties of those functions.
+  In particular, it requires that the implementation should be able to return the `simplePartyT`,
+  and that the returned `simplePartyT` should always satisfy the `goodSimpleParty` predicate.
+  Additionally, the implementation should know how to process messages of type `partyInputT`,
+  and that the old state and the new state should be related by the `goodTransition` predicate.
+  For a full list of functions and their properties, refer to the module itself. 
+
+  8) `GammaEvaluatorConsistencyChannelLemmas` -- this module contains the statement of the `totalEvaluatorMinusTotalBalanceMonotone` lemma,
+  which ensures that the value returned by the evaluator is consistent with the internal bookkeeping of the party.
+
+  9) `GoodTransitionTransitiveLemmas` -- this module contains the statement of the `goodTransitionTransitive` lemma,
+  which states that the `goodTransition` predicate is transitive. This fact will be later used in `honestPartyInteractions.mlw`
+  to prove that our implementation of the HonestParty actually satisfies the `goodTransition` predicate (as required by the `AbstractPartySpec` module). 
+  Thanks to the transitivity of `goodTransition`, we will be able to show that in a small-step, modular fashion.
+
+  Later `_Proofs` modules contain proofs of facts stated in `_Lemmas` modules. This is a part of the Statement-Proof separation
+  convention explained in detail at the beginning of the `ClosingWorksLemmas` module.
+*)
+
+
+module SimplePartyTypes 
+  use signaturesFunctionality.SignaturesFunctionality
+  use gamma.Gamma
+  use basicTypes.BasicTypes
+  
+  use list.Append 
+  use listLibrary.ListLibrary
+  
+  (* This is the limited view of the party state, with data that any reasonable implementation should be able to provide. It is used in the abstract specification of the party. *)
+  type simplePartyT = 
+  {
+      channelInfo : partySplitsAndRevocationsRecordGeneralT; (* simplified view of the party state related to channel operation, see comments on  `partySplitsAndRevocationsRecordGeneralT` in basicTypes.mlw/BasicTypes *)
+      onChainBalance : amountT; (*how much funds party claims it has on-chain (inside PublicKeyAccounts)  *)
+      channelBalanceExt : amountT; (* how much funds party claims it has in the channel *)
+      closingChannel : bool; (* true if party is closing the channel *)
+  }
+  (* Note that we want the party to track its funds separately for the channel and for the on-chain account.
+     This makes it easier to keep the books in order and to ensure funds security. 
+     For instance, when the party funds a channel, it should reallocate funds 
+     from the on-chain account to the in-channel account.
+     
+     Later, in `honestPartyVsAdversary.mlw`, we will define `expectedAmount` which is the amount that the party is supposed to have tracked by the security experiment,
+     and we will prove that for any implementation that satisfies the specification provided by this file,
+     the sum of reported amounts (both on-chain and off-chain) is at least equal to `expectedAmount`. *)
+
+
+  (* Getters for `simplePartyT` *)
+  let function channelBalance (p : simplePartyT) : amountT =
+    p.channelInfo.makeStrict.balanceOurAGenericOption
+
+  let function balanceTotal (p : simplePartyT) : amountT =
+    p.onChainBalance + p.channelBalance
+
+  let function balanceTotalExt (p : simplePartyT) : amountT =
+    p.onChainBalance + p.channelBalanceExt
+  
+  let function simplePartySide (r : simplePartyT) : partyT =
+    r.channelInfo.recordOwnerG
+  
+  
+  (* This type contains the information about the system that the party can access. *)
+  type partySystemView = {
+    sigState : signatureFunctionalityT; (* state of signature functionality *)
+    gammaState : gammaStateT; (* state of gamma *)
+    currentTime : timeT;
+    lastWoken : timeT; (* last activation of honest party *)
+  }
+  
+  (* This type describes the way in which a party can update the state of the system. *)
+  (* See `systemPartyProcessMs` in `honestPartyVsAdversary.mlw` to see how it is applied to the system state. *)
+  type updateRecT = {
+    newSigState : signatureFunctionalityT; (* new, updated state of signature functionality *)
+    msgsToSend : list msgToGammaT; (* list of msgs sended by party to gamma *)
+    msgsToSendToCounterParty : list msgToPartyT; (* list of msgs sended by party to counter-party *)
+    moneyReceivedInChannel : amountT; (* reporting receiving this amount inside channel *)
+    moneySentInChannel : amountT; (* how much money was send in channel by transition *)
+    moneySentOnChain : amountT; (* how much money was send on chain by transition *)
+    moneyMovedToChannel : amountT; (* how much our money having moved from on-chain account to in channel account by transition *)
+    timeProcessedTo : timeT; (* represents the time up to which the party has processed events. In the final state, it should match the 'currentTime',
+                                but it is useful to have it reported by the party, as it allows for a modular party implementation. *)
+  }
+    
+  (* Trivial update that does not change anything, except of sigState and timeProcessedTo, which need to be provided explicitly *)
+  let function emptyUpdate2 (sigs : signatureFunctionalityT) (timeTo : timeT) : updateRecT =
+  {
+    newSigState = sigs;
+    timeProcessedTo = timeTo;
+    msgsToSend = Nil;
+    msgsToSendToCounterParty = Nil;
+    moneyReceivedInChannel = 0;
+    moneySentInChannel = 0;
+    moneySentOnChain = 0;
+    moneyMovedToChannel = 0;
+    }
+  
+  (* Trivial update that does not change anything, computed from a particular system view. *)
+  let function emptyUpdate (system : partySystemView) : updateRecT =
+    emptyUpdate2 system.sigState system.lastWoken
+  
+  
+  (* Function that adds new messages to the message queue, with timestamp equal to the current time *)
+  let function updateMsgs (currentTime : timeT) (oldMsgs : list (msgToGammaT, timeT)) (update : updateRecT) : list (msgToGammaT, timeT) =
+    oldMsgs ++ map (fun x -> (x, currentTime)) update.msgsToSend
+  
+  (* Updates can be combined (squashed) together into a bigger update, such that the resulting update is equivalent to applying the updates in sequence.
+     In `GoodTransitionTransitiveLemmas`, we prove this fact formally. *) 
+  let function combineUpdateRecs (u1 u2 : updateRecT) : updateRecT =
+  { newSigState = u2.newSigState;
+    msgsToSend = u1.msgsToSend ++ u2.msgsToSend;
+    msgsToSendToCounterParty = u1.msgsToSendToCounterParty ++ u2.msgsToSendToCounterParty;
+    moneyReceivedInChannel = u1.moneyReceivedInChannel + u2.moneyReceivedInChannel;
+    moneySentInChannel = u1.moneySentInChannel + u2.moneySentInChannel;
+    moneySentOnChain = u1.moneySentOnChain + u2.moneySentOnChain;
+    moneyMovedToChannel = u1.moneyMovedToChannel + u2.moneyMovedToChannel;
+    timeProcessedTo = u2.timeProcessedTo;
+  }
+  
+  (* How to apply `updateRecT` to a `partySystemView`. This is a simplified version of the logic from `systemPartyProcessMsg` in `honestPartyVsAdversary.mlw`*)
+  let function applyUpdateRec (s : partySystemView) (u : updateRecT) : partySystemView =
+  { sigState = u.newSigState;
+    gammaState = s.gammaState;
+    currentTime = s.currentTime;
+    lastWoken = u.timeProcessedTo;
+  }
+
+
+end (*SimplePartyTypes*)
+
+module SimplePartyEvaluator 
+  use basicTypes.BasicTypes
+  use signaturesFunctionality.SignaturesFunctionality
+  use gamma.Gamma
+  use gamma.Evaluator
+
+  use SimplePartyTypes
+
+  (* This function calculates the difference between what the evaluator reports the party has and what the party claims to have. *)
+  (* In honestPartyVsAdversary.mlw, we will show that this value is always non-negative. *)
+  let function totalEvaluatorMinusTotalBalance
+                                      (p : simplePartyT) (sigs : signatureFunctionalityT) (gamma : gammaStateT) 
+                                      (lastWoken : timeT) (msgs : list (msgToGammaT, timeT)) : amountT=
+    partyExpectationsFull gamma sigs p.channelInfo lastWoken msgs - p.balanceTotal
+
+end (*SimplePartyEvaluator*)
+
+
+module GoodSplitsAndRevocationsRecord
+
+  (* The main goal of this module is to define the predicate `goodSplitsAndRevocationsRecord`, which specifies the desired properties of the `partySplitsAndRevocationsRecordStrictT`.
+     We also define the version of this predicate for the `partySplitsAndRevocationsRecordGeneralT`. *)
+
+  use int.Int
+  use option.Option
+  use list.List
+  use list.NumOcc
+  use list.Append
+
+  use basicTypes.BasicTypes
+  use basicTypes.Compare
+  use signaturesFunctionality.SignaturesFunctionality
+  use gamma.Gamma
+  use gamma.GammaInvariant
+  use listLibrary.ListLibrary
+
+  (*A function that looks for a revocation of `x`, received from the other party. *)
+  let rec function findSplitRevocation (x : conditionalOutputT) (l : revokedSplitsListT) : option signatureT =
+    returns { | None -> forall s : signatureT. num_occ (s, x) l = 0
+              | Some s -> num_occ (s, x) l > 0 }
+    variant { l } 
+    match l with
+    | Nil -> None
+    | Cons (hdSig, hd) tl -> 
+        if compareConditionalOutputs hd x then 
+          (Some hdSig)
+        else
+          (findSplitRevocation x tl)
+    end
+    
+  let lemma findSplitRevocationSoExists (x : conditionalOutputT) (l : revokedSplitsListT) =
+  requires {isSome (findSplitRevocation x l)}
+  ensures {exists sig . member (sig, x) l}
+  match findSplitRevocation x l with 
+  | None -> absurd 
+  | Some s -> assert {member (s, x) l}
+  end
+  
+  (* Basic sanity check for a split (i.e., commitment). *)
+  let predicate hasSaneAmounts (s : splitT) =
+    s.condOutput.channelCapacity >= s.condOutput.amountCond &&
+    s.condOutput.amountCond >= 0 &&
+    s.condOutput.id.totalAmount >= 0
+  
+  (* Function `recordOwner` lifted to option type *)
+  let function maybeRecordOwner (arg : option partySplitsAndRevocationsRecordStrictT) : option partyT = 
+    match arg with 
+      | Some arg -> Some arg.recordOwner
+      | None -> None
+    end
+  
+  (* Main property of a split, signed by a honest party.
+     We require that every split signed by the honest party should satisfy one of the following conditions.*)
+  predicate signedSplitsSpecExt
+    (p: partyT) (keysForRevoke: revokedSplitsListT)
+    (s: splitT) (expectedAmount : amountT) (sigState : signatureFunctionalityT)
+  =
+    (* It is the current commitment sent to the counterparty. *)
+    (s.condOutput.partyCond = other p /\ s.amountUnCond >= expectedAmount) \/
+    (* It is an old, revoked commitment sent to the counterparty. *)
+    isSome (findSplitRevocation s.condOutput keysForRevoke) \/
+    (* It is the current commitment received from the counterparty and has not been revoked by the honest party. *)
+    (
+      s.condOutput.partyCond = p /\
+      s.condOutput.amountCond =  expectedAmount /\
+      (forall sig. not verify p (SignableRevoke s.condOutput) sig sigState)
+    )
+  
+  
+  (* Main property of the `partySplitsAndRevocationsRecordStrictT`. It should satisfy all of the following conditions. *)
+  predicate goodSplitsAndRevocationsRecord (pg : partySplitsAndRevocationsRecordStrictT) (sigState : signatureFunctionalityT) =
+    let bestHs =  pg.bestSplitReceived in
+    let amountExpected = bestHs.split.condOutput.amountCond in
+
+    (* All splits signed by the honest party satisfy `signedSplitsSpecExt` *)
+    (forall split sig. verify (pg.recordOwner) (SignableSplit split) sig sigState ->
+      signedSplitsSpecExt pg.recordOwner pg.receivedRevocations split amountExpected sigState) /\
+
+    (* In all the revocations stored by the honest party, the counterparty is the conditional party. *)
+    (forall msplit, sig. num_occ (sig, msplit) pg.receivedRevocations > 0 -> msplit.partyCond = other pg.recordOwner) /\
+    
+    (* All the revocations stored by the honest party are correctly signed by the counterparty. *)
+    (forall sig msplit. num_occ (sig, msplit) pg.receivedRevocations > 0 -> verify (other pg.recordOwner) (SignableRevoke msplit) sig sigState) /\
+
+    (* Moreover, the best split (i.e. commitment) received by the honest party (as stored in `bestSplitReceived`) satisfies all of the following conditions: *)
+
+    (* It is not revoked. *)
+    (forall sig. not verify pg.recordOwner (SignableRevoke bestHs.split.condOutput) sig sigState) /\
+
+    (* The honest party is its conditional party. *)
+    bestHs.split.condOutput.partyCond = pg.recordOwner /\
+      
+    (* It has sane amounts. *)
+    hasSaneAmounts bestHs.split /\
+
+    (* It is correctly signed by the counterparty. *)
+    (verify (other pg.recordOwner) (SignableSplit bestHs.split) bestHs.sigUnCond sigState) /\
+    
+    true (* The final true allows for trailing '/\'s in the definition. *) 
+
+  (* `goodSplitsAndRevocationsRecord` lifted to option type. *)
+  predicate goodSplitsAndRevocationsRecordOption (pg : option partySplitsAndRevocationsRecordStrictT) (sigState : signatureFunctionalityT) =
+    match pg with
+    | None -> true
+    | Some x -> goodSplitsAndRevocationsRecord x sigState
+    end
+  
+  (* `goodSplitsAndRevocationsRecord` lifted to `partySplitsAndRevocationsRecordGeneralT`. *)
+  predicate goodSplitsAndRevocationsRecordGeneral (pg : partySplitsAndRevocationsRecordGeneralT) (sigState : signatureFunctionalityT) =
+    goodSplitsAndRevocationsRecordOption pg.makeStrict sigState
+  
+  (* An auxiliary predicate used once in `honestPartyInterface.mlw`. Consider moving it there or removing it. *)
+  (* Check that the party can account for all channel-opening transactions that is has signed. *)
+  predicate partyKeepTrackOfSignedTxOpeningChannel (p : partySplitsAndRevocationsRecordGeneralT) (sigState : signatureFunctionalityT) =
+    forall args sig.
+      args.sender=p.recordOwnerG ->
+      verify p.recordOwnerG (SignableTX args) sig sigState ->
+      args.destination = Channel ->
+        ((p.bestSplitReceivedG) <&> (fun x -> x.split.condOutput.id) ) = Some args (* pay-nonce *)
+  
+end (*GoodSplitsAndRevocationsRecord*)
+
+
+module GoodTransitionChannel
+
+  (* The main goal of this module is to define the predicate `goodTransitionForChannel`, 
+     which specifies necessary properties of the `simplePartyT` transition that guarantee the security of funds in the channel. *)
+
+  use int.Int
+  use option.Option
+  use list.List
+  use list.NumOcc
+  use list.Append
+
+  use basicTypes.BasicTypes
+  use basicTypes.Compare
+  use signaturesFunctionality.SignaturesFunctionality
+  use gamma.Gamma
+  use listLibrary.ListLibrary
+  use gamma.Evaluator
+
+  use GoodSplitsAndRevocationsRecord
+  use SimplePartyTypes
+
+  (* Check that the party's channel is in DisputeOpen state and, if so, returns when and by which commitment transactions it was opened. *)
+  let function isOurChannelInDisputeOpen (gamma : gammaStateT) (channelId : transferFromPublicKeyAccountT) : option (timeT, conditionalOutputT)  =
+    match extractChannelByIdFromGamma gamma channelId with
+    | None -> None
+    | Some simpleChannel ->
+      match simpleChannel.contractStatus with
+      | DisputeOpen msplitResolved ->
+        Some (simpleChannel.lastContractTransitionTime, msplitResolved)
+      | _ -> None
+      end
+    end
+  
+   (* Check that the party's channel is in Normal. *)
+   let predicate isOurChannelInNormal (gamma : gammaStateT) (channelId : transferFromPublicKeyAccountT) =
+    match extractChannelByIdFromGamma gamma  channelId with
+    | None -> false
+    | Some simpleChannel ->
+      match simpleChannel.contractStatus with
+      | Normal _ -> true
+      | _ -> false
+      end
+    end
+   
+   (* Check if the tracked channel's virtual status is Normal.
+      For the definition of virtual status, refer to `computeVirtualContractStatus` in `gamma.mlw`. *)
+   let predicate isRecordsVirtualChannelInNormal (p : partySplitsAndRevocationsRecordGeneralT) (gamma : gammaStateT) (sigs : signatureFunctionalityT) = 
+   match (makeStrict p) with 
+    | None -> false 
+    | Some ps ->
+      match computeVirtualContractStatus ps.getTracedChannelId gamma ps.recordOwner sigs with 
+      | None -> false 
+      | Some ch -> ch.isNormalChannel
+      end
+    end
+   
+  (* Check that the tracked channel's status is Normal. *)
+  predicate isRecordsChannelInNormal (gamma : gammaStateT) (p : partySplitsAndRevocationsRecordGeneralT) = 
+    match makeStrict p with 
+    | None -> false 
+    | Some x -> isOurChannelInNormal gamma x.bestSplitReceived.split.condOutput.id
+    end
+
+  (* Check that the tracked channel's status is DisputeOpen. *)
+  predicate isRecordsChannelInDisputeOpen (gamma : gammaStateT) (p : partySplitsAndRevocationsRecordGeneralT) = 
+    match makeStrict p with 
+    | None -> false 
+    | Some x -> isOurChannelInDisputeOpen gamma x.bestSplitReceived.split.condOutput.id <> None
+    end
+    
+  
+  (* Check that party sends revocation to Gamma, whenever possible, i.e., whenever all of the following hold:
+  a) The tracked channel is in DisputeOpen.
+  b) The party has a correct revocation to send.
+  c) Messages sent now are guaranteed to be delivered before the timelock is released. *)
+  predicate revocationSendIfRequired (pg : partySplitsAndRevocationsRecordGeneralT) (originalLastWoken : timeT) (updateRec : updateRecT) (gamma : gammaStateT) =
+    (originalLastWoken <> updateRec.timeProcessedTo) ->
+    match pg.makeStrict with
+    | None -> true
+    | Some p ->
+      match isOurChannelInDisputeOpen gamma p.bestSplitReceived.split.condOutput.id with
+      | None -> true
+      | Some (disputeOpenTime, msplitInResolution) ->
+        (updateRec.timeProcessedTo  < disputeOpenTime + channelTimelock - deltaNet -> (
+        (exists sig. num_occ (sig, msplitInResolution) p.receivedRevocations > 0) ->
+          (exists msg. applicableRevokeMsg updateRec.newSigState msplitInResolution msg /\ num_occ msg updateRec.msgsToSend > 0)
+        ))
+      end
+    end
+  
+  (* Expresses legal channel transfers. A transfer is legal if it satisfies at least one of the following conditions: *)
+  predicate onlyLegalTransfers (pg1 pg2 : partySplitsAndRevocationsRecordGeneralT) (gamma : gammaStateT) (sigs2 : signatureFunctionalityT) =
+    (* It is always allowed not to change anything. *)
+    (pg2.balanceOurAGeneralOrNone = pg1.balanceOurAGeneralOrNone) 
+    \/
+    (* When the traced channel is in Normal, the party is allowed to perform any transfer. This allows for processing of payments inside the channel during its normal operation. *)
+    isRecordsChannelInNormal gamma pg1 
+    \/
+    (* The party can start tracking a channel in a Normal state (if it did not trace any channel before). This is used during channel opening. *)
+    (pg1.makeStrict = None /\ isRecordsVirtualChannelInNormal pg2 gamma sigs2) 
+    
+  (* Checks if the delay between two party activations is legal. *)
+  predicate lastWokenInTime (lastWoken1 lastWoken2 : timeT) =
+    lastWoken1 <= lastWoken2 /\ lastWoken2 - lastWoken1 <= deltaWake
+  
+  (* Checks that party does not change the id of the traced channel. *)
+  let predicate bestHsSplitTransition (os1 os2 : option halfSignedSplitT) =
+    match os1, os2 with
+    | None, _ -> true
+    | Some _s1, None -> false
+    | Some s1, Some s2 -> compareArgs s1.split.condOutput.id s2.split.condOutput.id
+    end
+  
+  (* Checks that party does not accept new revocations when channel is already in DisputeOpen. *)
+   predicate noNewRevocationsWhenDisputeOpen (g : gammaStateT) (pgOld pgNew : partySplitsAndRevocationsRecordGeneralT) =
+    isRecordsChannelInDisputeOpen g pgNew -> pgOld.receivedRevocationsG = pgNew.receivedRevocationsG
+  
+  (* The main predicate of the module. *)
+  predicate goodTransitionForChannel (pgOld : partySplitsAndRevocationsRecordGeneralT)
+                                     (systemView : partySystemView)
+                                     (pgNew : partySplitsAndRevocationsRecordGeneralT)
+                                     (update : updateRecT)  =             
+    pgOld.recordOwnerG = pgNew.recordOwnerG /\
+    bestHsSplitTransition pgOld.bestSplitReceivedG pgNew.bestSplitReceivedG  /\
+    includedList pgOld.receivedRevocationsG pgNew.receivedRevocationsG /\
+    revocationSendIfRequired pgNew systemView.lastWoken update systemView.gammaState /\
+    onlyLegalTransfers pgOld pgNew systemView.gammaState update.newSigState /\
+    noNewRevocationsWhenDisputeOpen systemView.gammaState pgOld pgNew
+
+
+ (* An auxiliary function used in proofs. Surplus of funds, defined as value returned by evaluator minus the value reported by the party.
+    In other words, this is the channel version of `totalEvaluatorMinusTotalBalance`. *)
+  let function channelMinusBalanceOurA (p : partySplitsAndRevocationsRecordGeneralT) (sigs : signatureFunctionalityT) (gamma : gammaStateT) 
+                                      (lastWoken : timeT) (msgs : list (msgToGammaT, timeT)) (currentTime : timeT) : amountT=
+    channelExpectationsG gamma sigs p lastWoken msgs currentTime
+    - p.balanceOurAGeneric
+    
+end (*goodTransitionForChannel *)
+
+
+module GoodTransitionClosing
+
+  (* This module defines the predicate `goodTransitionForClosing`, which contains the properties
+      of the `simplePartyT` transition that guarantee the timely closure of the channel.*)
+
+  use int.Int
+  use option.Option
+  use list.List
+  use list.NumOcc
+  use list.Append
+  use basicTypes.BasicTypes
+  
+  use basicTypes.Compare
+
+  use signaturesFunctionality.SignaturesFunctionality
+  use gamma.Gamma
+  use gamma.Evaluator
+  use listLibrary.ListLibrary
+  
+  use GoodSplitsAndRevocationsRecord
+  use GoodTransitionChannel
+  use SimplePartyTypes
+  
+  
+  (* Checks if the input of the given `transferFromPublicKeyAccountT` is unspent on gamma. *)
+  let predicate inputPresentOnGamma (gamma : gammaStateT) (id : transferFromPublicKeyAccountT) =
+    let input = expectedContractStatusMoveOwnCoins id in 
+    member_comp compareContractStatus input gamma.contractStatuses
+  
+  (* Checks if the given `msgToGamma` is a valid channel opening of a channel whose id is equal to `args`. *)
+  predicate correctChannelOpening (args : transferFromPublicKeyAccountT) (sigState : signatureFunctionalityT) (gamma : gammaStateT) (msg : msgToGammaT) =
+    match msg with 
+    | MoveOwnCoinsOnChain (args', sig, _id1, _id2) -> 
+        verify args.sender (SignableTX args) sig sigState /\
+        args' = args /\
+        0 <= args.amount <= args.totalAmount /\
+        inputPresentOnGamma gamma args
+    | _ -> false
+    end
+  
+  (* Checks if the given `msgToGammaT` is a valid commitment transaction (i.e. dispute opener) for a channel whose id is equal to `args`. *)
+  predicate correctDisputeOpen (args : transferFromPublicKeyAccountT) (sigState : signatureFunctionalityT) (msg : msgToGammaT) = 
+    match msg with 
+    | OpenDispute (hs, signature, _id) -> 
+        verify (other hs.split.condOutput.partyCond) (SignableSplit hs.split) hs.sigUnCond sigState /\ 
+        verify (hs.split.condOutput.partyCond) (SignableSplit hs.split) signature sigState /\
+        goodSplit hs.split /\
+        hs.split.condOutput.id = args
+    | _ -> false
+    end
+  
+  (* Checks if the given `msgToGammaT` is a valid `ClaimAfterTimeout` for a channel whose id is equal to `args`. *)
+  predicate correctClaimAfterTimeout (split : conditionalOutputT) (sigState : signatureFunctionalityT) (msg : msgToGammaT) = 
+    match msg with 
+    | ClaimAfterTimeout (ms, signature, _id) ->
+        split = ms /\
+        verify split.partyCond (SignableClosure split) signature sigState
+    | _ -> false
+    end
+  
+  (* Checks that a party only commits to a channel only if one of the following conditions holds:
+  1) The channel is already in Normal state (used by the fundee); or
+  2) The party sent a valid channel-opening message, for the channel that it is committing to (used by the funder). *)
+  predicate whenComingToChannelChannelOpenerSentOrChannelPresentOnGamma
+                                     (pgOld : simplePartyT)
+                                     (systemView : partySystemView)
+                                     (pgNew : simplePartyT)
+                                     (update : updateRecT) = 
+  match pgOld.channelInfo.makeStrict, pgNew.channelInfo.makeStrict with 
+  | None, Some p ->
+    let id = p.getTracedChannelId in 
+    isOurChannelInNormal systemView.gammaState id \/
+    (exists msg. member msg update.msgsToSend /\ correctChannelOpening id update.newSigState systemView.gammaState msg)
+  | _ -> true
+  end
+  
+  (* Checks that the party does not forget that it is closing the channel. *)
+  predicate closingPreserved (pgOld pgNew : simplePartyT) = 
+    match pgOld.closingChannel, pgNew.closingChannel with
+      | True, False -> false 
+      | _ -> true
+    end
+  
+  (* Auxiliary predicate for `whenClosingSendsOpenDispute`.
+     It checks that, if all of the following conditions hold, the party sends a correct `OpenDispute` message:
+      1) The honest party is committed to some channel.
+      2) The channel is open on gamma and in Normal state.
+    This behavior is expected when the party is closing the channel, which we check in the full predicate. *)
+  predicate whenClosingSendsOpenDisputeInner (pgNew : simplePartyT) (gamma : gammaStateT) (update : updateRecT) = 
+  match pgNew.channelInfo.makeStrict with
+  | None -> true
+  | Some p ->
+    let id = p.getTracedChannelId in
+    match extractChannelByIdFromGamma gamma id with
+    | None -> true 
+    | Some ch ->
+      match ch.contractStatus with
+      | Normal args -> 
+        exists msg. member msg update.msgsToSend /\ correctDisputeOpen args update.newSigState msg
+      | _ -> true
+      end
+    end
+  end
+  
+  (* Checks that, if both of the following conditions are true, then `whenClosingSendsOpenDisputeInner` holds:
+      1) The party is closing the channel.
+      2) The party is updated during the transition OR
+         The party initiated closing during the current transition.
+      The last condition allows the party not to send the `OpenDispute` message every time it sees the channel in the Normal state, 
+      which makes it possible to implement Honest Party in a modular way. *)
+  predicate whenClosingSendsOpenDispute (pgOld pgNew : simplePartyT) (gamma : gammaStateT) (originalLastWoken : timeT) (update : updateRecT) = 
+  if not pgNew.closingChannel then true else
+  if not (originalLastWoken <> update.timeProcessedTo || not pgOld.closingChannel) then true else
+    whenClosingSendsOpenDisputeInner pgNew gamma update
+
+  (* Auxiliary predicate for `whenDisputeOpenAfterTimeoutAndCorrectSideSendClaim`.
+     It checks that, if all of the following conditions hold, the party sends a correct `ClaimAfterTimeout` message:
+       1) The honest party is committed to some channel.
+       2) The channel is open on gamma and in DisputeOpen state.
+       3) The party is the unconditional side of the dispute (and therefore it can send the `ClaimAfterTimeout` message).
+       4) The timelock for sending the `ClaimAfterTimeout` message has expired. *) 
+  predicate whenDisputeOpenAfterTimeoutAndCorrectSideSendClaimInner (pgNew : simplePartyT) (gamma : gammaStateT) (update : updateRecT) =
+  match pgNew.channelInfo.makeStrict with 
+  | None -> true
+  | Some p ->
+    let id = p.getTracedChannelId in
+    match extractChannelByIdFromGamma gamma id with
+    | None -> true
+    | Some ch ->
+      match ch.contractStatus with
+      | DisputeOpen msplit ->
+        other (msplit.partyCond) = pgNew.simplePartySide \/
+        update.timeProcessedTo <= ch.lastContractTransitionTime + channelTimelock \/
+        (exists msg. member msg update.msgsToSend /\ correctClaimAfterTimeout msplit update.newSigState msg)
+      | _ -> true
+      end
+    end
+  end
+  
+  (* Checks that, if both of the following conditions are true, then `whenDisputeOpenAfterTimeoutAndCorrectSideSendClaimInner` holds:
+      1) The party is closing the channel.
+      2) The party is updated during the transition OR
+         The party initiated closing during the current transition.
+    The last condition allows the party not to send the `ClaimAfterTimeout` message every time it sees the channel in the `DisputeOpen` state, 
+    which makes it possible to implement Honest Party in a modular way.*)
+  predicate whenDisputeOpenAfterTimeoutAndCorrectSideSendClaim (pgOld pgNew : simplePartyT) (gamma : gammaStateT) (originalLastWoken : timeT) (update : updateRecT) =
+  if not pgNew.closingChannel then true else
+  if not (originalLastWoken <> update.timeProcessedTo || not pgOld.closingChannel) then true else
+    whenDisputeOpenAfterTimeoutAndCorrectSideSendClaimInner pgNew gamma update
+  
+  (* Checks that the party cannot commit to a channel when it is closing. *)
+  predicate whenClosingDontCommitToChannel (pgOld : simplePartyT) (pgNew : simplePartyT) =
+    pgOld.closingChannel ->
+    pgOld.channelInfo.makeStrict = None ->
+    pgNew.channelInfo.makeStrict = None
+  
+  (* The main predicate of this module. It combines all the predicates related to closing the channel into one. *)
+  predicate goodTransitionForClosing (pgOld : simplePartyT)
+                                     (systemView : partySystemView)
+                                     (pgNew : simplePartyT)
+                                     (update : updateRecT)  =
+    closingPreserved pgOld pgNew /\
+    whenComingToChannelChannelOpenerSentOrChannelPresentOnGamma pgOld systemView pgNew update /\
+    whenClosingSendsOpenDispute pgOld pgNew systemView.gammaState systemView.lastWoken update /\
+    whenDisputeOpenAfterTimeoutAndCorrectSideSendClaim pgOld pgNew systemView.gammaState systemView.lastWoken update /\
+    whenClosingDontCommitToChannel pgOld pgNew
+
+end (*GoodTransitionClosing*)
+
+
+module GoodTransition
+
+ (*  In this module we define the predicate `goodTransition`, which is the full specification of the allowed transitions of the `simplePartyT`. 
+      This predicate combines the properties of `goodTransitionForChannel` and `goodTransitionForClosing` with a few new properties.
+      It also defines the predicate `goodSimpleParty`, which specifies the necessary static properties of the `simplePartyT` type.
+      Predicates `goodSimpleParty` and `goodTransition` are the main ingredients of the specification of the Honest Party. *)
+
+use SimplePartyTypes 
+use GoodSplitsAndRevocationsRecord
+use GoodTransitionChannel 
+use GoodTransitionClosing 
+use SimplePartyTypes 
+use gamma.Gamma
+use gamma.Evaluator
+use basicTypes.BasicTypes
+
+
+use int.Int
+
+use signaturesFunctionality.SignaturesFunctionality
+
+  (* This predicate defines the important static properties of the `simplePartyT` type. *)
+  predicate goodSimpleParty (p : simplePartyT) (sigs : signatureFunctionalityT) =
+    goodSplitsAndRevocationsRecordGeneral p.channelInfo sigs /\
+    p.channelBalanceExt <= p.channelInfo.makeStrict.balanceOurAGenericOption /\
+    p.onChainBalance >= 0 /\
+    p.channelBalanceExt >= 0
+
+  (* This predicate defines the necessary conditions that guarantee the correct handling of the on-chain funds. 
+     It uses a limited for of the evaluator (`immediatePartyExpectations`) that only considers `PublicKeyAccount`. *)
+  predicate goodTransitionForChain (pgOld : simplePartyT)
+                                   (systemView : partySystemView)
+                                   (pgNew : simplePartyT)
+                                   (update : updateRecT)  =
+  pgOld.simplePartySide = pgNew.simplePartySide /\ 
+  immediatePartyExpectations systemView.gammaState pgNew.simplePartySide update.newSigState >=             
+  immediatePartyExpectations systemView.gammaState pgOld.simplePartySide systemView.sigState - update.moneySentOnChain - update.moneyMovedToChannel
+
+  (* This predicate checks that the internal bookkeeping of the party is consistent. *)
+  predicate goodTransitionAccounting (pgOld : simplePartyT)
+                                     (_systemView : partySystemView)
+                                     (pgNew : simplePartyT)
+                                     (update : updateRecT)  =
+  pgNew.channelBalanceExt >= pgOld.channelBalanceExt + update.moneyReceivedInChannel - update.moneySentInChannel + update.moneyMovedToChannel /\
+  pgNew.onChainBalance = pgOld.onChainBalance - update.moneySentOnChain - update.moneyMovedToChannel
+  
+  (* This predicate checks that the party does not report negative amounts. *)
+  predicate goodTransitionBasic (update : updateRecT) =
+    update.moneyReceivedInChannel >= 0 /\
+    update.moneySentInChannel >= 0 /\
+    update.moneySentOnChain >= 0 /\
+    update.moneyMovedToChannel >= 0
+  
+  (* The full specification of the transition of the `simplePartyT`. *)
+  predicate goodTransition (pgOld : simplePartyT)
+                           (systemView : partySystemView)
+                           (pgNew : simplePartyT)
+                           (update : updateRecT)  =
+  goodTransitionForChannel pgOld.channelInfo systemView pgNew.channelInfo update /\
+  goodTransitionForChain pgOld systemView pgNew update /\
+  goodTransitionAccounting pgOld systemView pgNew update /\
+  goodTransitionForClosing pgOld systemView pgNew update /\
+  goodTransitionBasic update /\
+  signatureFunctionalityTransition (other pgOld.simplePartySide) systemView.sigState update.newSigState
+
+
+end (*GoodTransition*)
+
+(* The module `AbstractPartySpec` defines the specification of a Lightning node. This is done by:
+  - declaring the (opaque) type `partyStateT` which describes the state of the party;
+  - declaring the (opaque) invariant `partyInvariant` which describes the internal invariant of the party;
+  - declaring the function `initialPartyState`, which generates the initial state of the Lightning node;
+  - declaring the function `partyProcessMsg`, which describes how a Lightning node processes a message.
+Thus far, functions `initialPartyState` and `partyProcessMsg` return values of the opaque type `partyStateT`, on which no direct specification is possible. To enable specification of such an abstract implementation, we require that the implementation provides a function `getSimpleParty`, which transforms the opaque `partyStateT` into the concrete `simplePartyT`. Therefore the module `AbstractPartySpec` also:
+ - declares the function `getSimpleParty : partyStateT -> simplePartyT`
+ - state the properties of `initialPartyState` and `partyProcessMsg` (expressed in terms of `getSimpleParty`). *)
+
+module AbstractPartySpec
+
+  (* This module defines the abstract party interface, specifying the functions that every 
+     HonestParty implementation must provide. Additionally, it lays out the properties that 
+     these functions need to satisfy for the implementation to be deemed correct and safe. 
+     These properties are declared as "val lemmas."
+
+     Unlike the typical -Lemmas modules, which declare lemmas about properties of functions 
+     defined elsewhere (and whose proofs are later provided in corresponding -Proofs modules), 
+     this -Abstract module directly defines both the functions and the properties they must satisfy. 
+     Consequently, it does not adhere to the Statement-Proof Separation convention. Instead, 
+     it acts as a specification interface, enforcing that any HonestParty implementation meets 
+     the required properties, rather than merely signaling that properties of previously defined 
+     functions hold.
+
+     For this reason, there is no corresponding -Proofs module. Instead, the 
+     `HonestPartyImplementationSpec` module provides the actual implementation of the functions 
+     and demonstrates that the implementation satisfies the properties specified in this module. *)
+
+  use signaturesFunctionality.SignaturesFunctionality
+  use gamma.Gamma
+  use gamma.GammaInvariant
+  use basicTypes.BasicTypes
+  
+  use list.Append 
+  use listLibrary.ListLibrary
+
+  use SimplePartyTypes
+  use SimplePartyTypes
+  use GoodTransition
+
+  (* First we declare an opaque type `partyStateT` and an opaque predicate `partyInvariant`. 
+     They will be instantiated by the implementation of the Honest Party. *)
+  
+  type partyStateT
+
+  predicate partyInvariant (p : partyStateT) (sigs : signatureFunctionalityT) 
+
+  (* Initial state of the party with given identity (A or B) and given on-chain balance.  *)
+  val function initialPartyState (_p : partyT) (onChainBalance : amountT) : partyStateT
+  requires { onChainBalance >= 0 }
+  
+  (* Party activation and message processing. This is the only way in which party can interact with the system. *)
+  val function partyProcessMsg (p : partyStateT) (_msg : partyInputT) (system : partySystemView) : (partyStateT, updateRecT)
+  requires { partyInvariant p system.sigState }
+  requires { gammaCoherent system.gammaState }
+  requires { system.lastWoken <= system.currentTime }
+  
+  (* The `simplePartyT` that corresponds to the current state of the party. 
+     Since this function transforms the opaque `partyStateT` into a concrete `simplePartyT`, 
+     it allows us to provide a specification for the abstract party interface. *)
+  val function getSimpleParty (p : partyStateT) : simplePartyT
+  
+  (* SPECIFICATION *)
+
+  (* --- Specification of `initialPartyState` --- *)
+  
+  (* The initial state of the party satisfies `goodSimpleParty`.*)
+  val lemma partyInitialInvariant (p : partyT) (onChainBalance : amountT) (sigs : signatureFunctionalityT)
+  requires {forall msg sig. not (verify p msg sig sigs)}
+  requires { onChainBalance >= 0 }
+  ensures  {partyInvariant (initialPartyState p onChainBalance) sigs}
+
+  (* The initial state of the party has a correct side (A or B). *)
+  val lemma partyInitialCorrectSide (p : partyT) (onChainBalance : amountT)
+  requires { onChainBalance >= 0 }
+  ensures  {(initialPartyState p onChainBalance).getSimpleParty.simplePartySide = p}
+
+  (* The initial state of the party correctly initializes the on-chain balance. *)
+  val lemma partyInitalOnChainBalance (p : partyT) (onChainBalance : amountT)
+  requires { onChainBalance >= 0 }
+  ensures  {(initialPartyState p onChainBalance).getSimpleParty.onChainBalance = onChainBalance}
+  
+  (* In the initial state, the party does not track a channel. *)
+  val lemma partyInitialChannelClose (p : partyT) (onChainBalance : amountT) 
+  requires { onChainBalance >= 0 }
+  ensures {not ((initialPartyState p onChainBalance).getSimpleParty.channelInfo.tracksAChannel)}
+
+  (* In the initial state, the party is not closing the channel. *)
+  val lemma partyInitialNotClosing (p : partyT) (onChainBalance : amountT)
+  requires { onChainBalance >= 0 }
+  ensures {not ((initialPartyState p onChainBalance).getSimpleParty.closingChannel)}
+
+  (* --- Specification of `partyProcessMsg` --- *)
+
+  (* The party invariant is preserved when processing a message. *)
+  val lemma partyInvariantPreservedWhenProcessMsg (p : partyStateT) (msg : partyInputT) (system : partySystemView) (newP : partyStateT) (update : updateRecT)
+  requires {partyProcessMsg p msg system = (newP, update)}
+  requires {partyInvariant p system.sigState}
+  requires {gammaCoherent system.gammaState }
+  requires { system.lastWoken <= system.currentTime }
+  ensures  {partyInvariant newP update.newSigState}
+  
+  (* The states of the party before and after processing a message satisfy `goodTransition`. *)
+  val lemma partyProcessMsgGoodTransition (p : partyStateT) (msg : partyInputT) (system : partySystemView) (newP : partyStateT) (update : updateRecT) 
+  requires {partyProcessMsg p msg system = (newP, update)}
+  requires {partyInvariant p system.sigState}
+  requires {gammaCoherent system.gammaState }
+  requires { system.lastWoken <= system.currentTime }
+  ensures {goodTransition p.getSimpleParty system newP.getSimpleParty update}
+
+  (* When processing a message, the party updates its time correctly. *)
+  val lemma upToDateAfterProcessMsg (p : partyStateT) (msg : partyInputT) (system : partySystemView) (update : updateRecT)
+  requires {(partyProcessMsg p msg system).snd = update}
+  requires {partyInvariant p system.sigState}
+  requires {gammaCoherent system.gammaState }
+  requires { system.lastWoken <= system.currentTime }
+  ensures {update.timeProcessedTo = system.currentTime}
+
+  (* The party does not spend more money than the `msg` calls for.
+     For example, `FromEnv (TransferOnChannel 10)` should not result in the party spending more than 10 coins in the channel,
+     and `FromEnv CloseNow` should not result in the party spending any coins.
+     For details, see the definitions of `allowedOnChainLoss` and `allowedOnChannelLoss` in `basicTypes.mlw`. *) 
+  val lemma partyProcessMsgSpendsWhatMsgAllows (p : partyStateT) (msg : partyInputT) (system : partySystemView) (update : updateRecT)
+  requires {(partyProcessMsg p msg system).snd = update}
+  requires {partyInvariant p system.sigState}
+  requires {gammaCoherent system.gammaState }
+  requires { system.lastWoken <= system.currentTime }
+  ensures {update.moneySentOnChain <= msg.allowedOnChainLoss}
+  ensures {update.moneySentInChannel <= msg.allowedOnChannelLoss}
+
+  (* After receiving a closing message, the party is closing the channel. *)
+  val lemma partyClosingAfterClosingRequest (p : partyStateT) (system : partySystemView) 
+  requires {partyInvariant p system.sigState}
+  requires {gammaCoherent system.gammaState }
+  requires { system.lastWoken <= system.currentTime }
+  ensures {(partyProcessMsg p (FromEnv CloseNow) system).fst.getSimpleParty.closingChannel}
+
+  (* --- Specification of `partyInvariant` --- *)
+
+  (* The party invariant remains valid after the adversary signs messages. *)
+  val lemma partyInvariantPreservedWhenAdversarySigns (p : partyStateT)  (sigs1 sigs2 : signatureFunctionalityT)
+  requires {signatureFunctionalityTransition (p.getSimpleParty).simplePartySide sigs1 sigs2}
+  requires {partyInvariant p sigs1}
+  ensures  {partyInvariant p sigs2}
+
+  (* The party invariant implies `goodSimpleParty`. *)
+  val lemma partyInvariantSoGoodSplitsAndRevocationsRecord (p : partyStateT) (sigState : signatureFunctionalityT)
+  requires {partyInvariant p sigState}
+  ensures  {goodSimpleParty  p.getSimpleParty sigState}
+
+end (*AbstractPartySpec*)
+
+
+module GammaEvaluatorConsistencyChannelLemmas 
+  (*This module follows the Statement-Proof separation convention. See the comment in honestPartyVsAdversary.mlw/ClosingWorksLemmas for more details.*)
+
+  use list.Append
+  
+  use basicTypes.BasicTypes
+  
+  use signaturesFunctionality.SignaturesFunctionality
+  use gamma.GammaInvariant
+  
+  use GoodSplitsAndRevocationsRecord
+  use GoodTransitionChannel
+  use SimplePartyTypes  
+  use GoodTransition
+
+  use SimplePartyEvaluator
+
+  (* The following lemma states that the evaluator is consistent with the internal bookkeeping of the party, i.e., 
+     if the party reports that is has gained X coins then the evaluator should increase by at least X coins,
+     and similarly if the party reports that is has spent X coins, then the evaluator should decrease by at most X coins. *)
+  (* All preconditions are implied by `goodTransition` and `goodSimpleParty`. The lemma only requires the relevant part. *)
+  val lemma totalEvaluatorMinusTotalBalanceMonotone (systemView : partySystemView) (pOld pNew : simplePartyT) (msgsOld : list (msgToGammaT, timeT)) (updateRec : updateRecT)
+  requires {gammaCoherent systemView.gammaState}
+  requires {goodSplitsAndRevocationsRecordOption pOld.channelInfo.makeStrict systemView.sigState}
+  requires {goodSplitsAndRevocationsRecordOption pNew.channelInfo.makeStrict updateRec.newSigState}
+  requires {included systemView.sigState updateRec.newSigState}
+  requires {lastWokenInTime systemView.lastWoken systemView.currentTime}
+  requires {updateRec.timeProcessedTo = systemView.currentTime}
+  requires {goodTransition pOld systemView pNew updateRec} 
+  ensures  {totalEvaluatorMinusTotalBalance pOld systemView.sigState systemView.gammaState systemView.lastWoken msgsOld  <=
+            totalEvaluatorMinusTotalBalance pNew updateRec.newSigState systemView.gammaState systemView.currentTime (updateMsgs systemView.currentTime msgsOld updateRec)}
+
+  
+end (*GammaEvaluatorConsistencyChannelLemmas *)
+
+(*transitivity of goodTransition` *)
+module GoodTransitionTransitiveLemmas 
+(*This module follows the Statement-Proof separation convention. See the comment in honestPartyVsAdversary.mlw/ClosingWorksLemmas for more details.*)
+
+(*In this module we state that `goodTransition` is transitive, and a few related facts which are going to be useful in `honestPartyInteraction.mlw`.*)
+
+use int.Int
+use option.Option
+use list.List
+use list.NumOcc
+use list.Append
+use basicTypes.BasicTypes
+
+
+use signaturesFunctionality.SignaturesFunctionality
+use gamma.Gamma
+use listLibrary.ListLibrary
+  
+use GoodTransitionChannel
+use gamma.Evaluator
+
+use SimplePartyTypes 
+use SimplePartyTypes
+use GoodTransition
+
+(* The function `combineUpdateRecs` is associative. *)
+val lemma combineUpdateRecsAssoc (u1 u2 u3 : updateRecT)
+ensures {combineUpdateRecs u1 (combineUpdateRecs u2 u3) = combineUpdateRecs (combineUpdateRecs u1 u2) u3}
+
+(* Applying two updates in sequence with `applyUpdateRec` is equivalent to combining the updates first using `combineUpdateRecs` and then applying the combined update.
+   In other words, `applyUpdateRec` is an action of `updateRectT` on `partySystemView`. *)
+val lemma applyUpdateRecAssoc (s : partySystemView) (u1 u2 : updateRecT)
+ensures {applyUpdateRec (applyUpdateRec s u1) u2 = applyUpdateRec s (combineUpdateRecs u1 u2)}
+
+(* Transitivity of `goodTransition`. *)
+val lemma goodTransitionTransitive (pgOld pgMid pgNew : simplePartyT) (update1 update2 : updateRecT) (systemView : partySystemView)
+requires {update1.timeProcessedTo <= update2.timeProcessedTo}
+requires {goodTransition pgOld systemView pgMid update1}
+requires {goodTransition pgMid (applyUpdateRec systemView update1) pgNew update2}
+ensures {goodTransition pgOld systemView pgNew (combineUpdateRecs update1 update2)}
+
+
+end (*GoodTransitionTransitiveLemmas*)
+
+(* ========= Proofs. Don't read, verify. ========*)
+
+module GammaEvaluatorConsistencyChannelProofs : GammaEvaluatorConsistencyChannelLemmas
+(*This module follows the Statement-Proof separation convention. See the comment in honestPartyVsAdversary.mlw/ClosingWorksLemmas for more details.*)
+
+  use int.Int
+  use option.Option
+  use list.List
+  use list.NumOcc
+  use list.Append
+  
+  
+  use basicTypes.BasicTypes
+  
+  use basicTypes.Compare
+  use signaturesFunctionality.SignaturesFunctionality
+  use gamma.Gamma
+  use gamma.Evaluator
+  use gamma.GammaInvariant
+ 
+  use listLibrary.ListLibrary
+  use gamma.EvaluatorEquivalentStatementLemmas
+  use gamma.EvaluatorBasicLemmas
+  use gamma.GammaBasicProofs
+
+  use SimplePartyTypes  
+  use GoodSplitsAndRevocationsRecord
+  use GoodTransitionChannel
+  use SimplePartyEvaluator
+  use GoodTransition
+  
+  (*--------------------------------*)
+  
+  
+  let lemma extractcontractStatusNotPublicKeyAccount (chId : transferFromPublicKeyAccountT) (gamma : gammaStateT) (ch : contractT) = 
+  requires {gammaCoherent gamma}
+  requires {extractChannelByIdFromGamma gamma chId = Some ch}
+  ensures {not (isPublicKeyAccount ch.contractStatus)}
+  match ch.contractStatus with 
+  | PublicKeyAccount _ _ _ -> absurd
+  | _ -> assert {not (isPublicKeyAccount ch.contractStatus)}
+  end
+  
+  let lemma computeVirtualContractNotPublicKeyAccount (chId : transferFromPublicKeyAccountT) (gamma : gammaStateT) (party : partyT) (time : timeT) (sigs : signatureFunctionalityT) (ch : contractT) = 
+  requires { gammaCoherent gamma}
+  requires {computeVirtualContract chId gamma party time sigs = Some ch}
+  ensures {not (isPublicKeyAccount ch.contractStatus)}
+  match chId.destination with
+  | Void -> absurd 
+  | OtherParty -> absurd 
+  | Channel -> assert {not (isPublicKeyAccount ch.contractStatus)}
+  end
+    
+    
+  let lemma computeVirtualContractMonotone (chId : transferFromPublicKeyAccountT) (gamma : gammaStateT) (party : partyT) (time : timeT) (sigs1 sigs2 : signatureFunctionalityT) = 
+  requires {included sigs1 sigs2}
+  requires {isSome (computeVirtualContract chId gamma party time sigs1)}
+  ensures {isSome (computeVirtualContract chId gamma party time sigs2)}
+  match chId.destination with 
+  | Void -> absurd
+  | OtherParty -> absurd 
+  | Channel -> assert {isSome (computeVirtualContract chId gamma party time sigs2)}
+  end
+    
+  let lemma computeVirtualContractStatusPreserved (chId : transferFromPublicKeyAccountT) (gamma : gammaStateT) (party : partyT) (time : timeT) (sigs1 sigs2 : signatureFunctionalityT) (ch1 ch2 : contractT) = 
+  requires {included sigs1 sigs2}
+  requires {computeVirtualContract chId gamma party time sigs1 = Some ch1}
+  requires {computeVirtualContract chId gamma party time sigs2 = Some ch2}
+  ensures {ch1 = ch2}
+  match chId.destination with 
+  | Void -> absurd
+  | OtherParty -> absurd 
+  | Channel -> assert {ch1 = ch2}
+  end
+  
+  let lemma virtualcontractStatusFromExtractcontractStatus (chId : transferFromPublicKeyAccountT) (gamma : gammaStateT) (party : partyT) (time : timeT) (sigs : signatureFunctionalityT) (ch : contractT) = 
+  requires  {gammaCoherent gamma}
+  requires  {extractChannelByIdFromGamma gamma chId = Some ch}
+  ensures {computeVirtualContract chId gamma party time sigs = Some ch}
+  match chId.destination with 
+  | Void
+  | OtherParty ->
+      assert {member ch gamma.activeContracts};
+      assert {member ch.contractStatus gamma.allContracts};
+      match ch.contractStatus with 
+      | PublicKeyAccount _ _ _ -> absurd 
+      | Normal funding ->
+        assert {funding = chId};
+        absurd
+      | DisputeOpen s -> 
+        assert {s.id = chId};
+        absurd
+      end
+  | Channel -> assert {computeVirtualContract chId gamma party time sigs = Some ch}
+  end
+  
+  let lemma virtualcontractStatusCorrect (chId : transferFromPublicKeyAccountT) (gamma : gammaStateT) (party : partyT) (time : timeT) (sigs : signatureFunctionalityT) (ch : contractT) = 
+  requires { computeVirtualContract chId gamma party time sigs = Some ch } 
+  ensures  { extractChannelId ch.contractStatus = Some chId}
+  match chId.destination with 
+  | Void -> absurd
+  | OtherParty -> absurd 
+  | Channel -> assert  { extractChannelId ch.contractStatus = Some chId}
+  end
+ 
+  
+  let lemma virtualcontractStatusNoneSoExtractStatusNone (chId : transferFromPublicKeyAccountT) (gamma : gammaStateT) (party : partyT) (time : timeT) (sigs : signatureFunctionalityT) = 
+  requires {gammaCoherent gamma}
+  requires {computeVirtualContract chId gamma party time sigs = None}
+  ensures  {extractChannelByIdFromGamma gamma chId = None}
+  ()
+  
+  let lemma computeVirtualContractGood (chId : transferFromPublicKeyAccountT) (gamma : gammaStateT) (party : partyT) (time : timeT) (sigs : signatureFunctionalityT) (ch : contractT) = 
+  requires { gammaCoherent gamma }
+  requires { computeVirtualContract chId gamma party time sigs = Some ch } 
+  ensures { goodStatus ch.contractStatus }
+  match chId.destination with 
+  | Void -> absurd
+  | OtherParty -> absurd
+  | Channel -> assert { goodStatus ch.contractStatus }
+  end
+  
+  let lemma channelExpectationsEqualBalanceWhenNormal  (gamma : gammaStateT) (p : partySplitsAndRevocationsRecordStrictT) (time : timeT)
+                                                       (sigs : signatureFunctionalityT) (lastWoken : timeT) (msgs : list (msgToGammaT, timeT)) = 
+  requires {gammaCoherent gamma}
+  requires {(((computeVirtualContract p.getTracedChannelId gamma p.recordOwner time sigs) <&> contractStatus) <&> isNormalChannel) = Some true}
+  requires {goodSplitsAndRevocationsRecord p sigs}
+  ensures  {p.bestSplitReceived.split.condOutput.amountCond = channelExpectations gamma sigs p lastWoken msgs time}
+  let chopt = computeVirtualContract p.getTracedChannelId gamma p.recordOwner time sigs in 
+  match chopt with 
+  | None -> absurd 
+  | Some ch -> 
+    match ch.contractStatus with 
+    | PublicKeyAccount _ _ _ -> absurd 
+    | DisputeOpen _ -> absurd
+    | Normal funding ->
+      assert {funding = p.getTracedChannelId};
+      assert {splitValue (p.bestSplitReceived.split) = funding.amount};
+      assert {p.bestSplitReceived.split.condOutput.id = funding }; 
+      assert {goodSplit (p.bestSplitReceived.split)};
+      let revocatedSplits = extractRevokedSplits (getSignedBy sigs p.recordOwner) in 
+      let revocationsReceived = extractRevocationsReceived p.recordOwner sigs p.receivedRevocations in 
+      let signedSplits = extractSignedSplits (getSignedBy sigs p.recordOwner) in 
+      let expectedAmount = p.bestSplitReceived.split.condOutput.amountCond in 
+      assert {expectedSplitResolutionTotal p.recordOwner revocatedSplits revocationsReceived p.bestSplitReceived.split = expectedAmount}; (*finisher*)
+      assert { forall s.  isSome (findSplitRevocation s p.receivedRevocations) -> exists sig. num_occ (sig, s) p.receivedRevocations > 0 };        
+      assert { forall s . isSome (findSplitRevocation s p.receivedRevocations) -> s.partyCond <> p.recordOwner}; 
+      assert {forall s v. s.condOutput.partyCond = p.recordOwner -> 
+                          s.condOutput.amountCond = expectedAmount -> 
+                          (forall sig. not verify (p.recordOwner) (SignableRevoke (s.condOutput)) sig sigs) -> 
+                          expectedSplitResolutionOption p.recordOwner p.getTracedChannelId revocatedSplits revocationsReceived s = Some v -> 
+                          v >= expectedAmount};
+      (*^unfold expectedSplitResolutionOption in H; unfold expectedSplitResolutionTotal in H*)                
+      assert {forall s v. s.condOutput.partyCond = other (p.recordOwner) -> 
+                          amountUnCond s >= expectedAmount -> 
+                          expectedSplitResolutionOption p.recordOwner p.getTracedChannelId revocatedSplits revocationsReceived s = Some v -> 
+                          v >= expectedAmount};                    
+      assert {forall s v. signedSplitsSpecExt p.recordOwner p.receivedRevocations s expectedAmount sigs -> 
+                          expectedSplitResolutionOption p.recordOwner p.getTracedChannelId revocatedSplits revocationsReceived s = Some v -> 
+                          v >= expectedAmount};
+      assert {forall s v. member s signedSplits -> 
+              expectedSplitResolutionOption p.recordOwner p.getTracedChannelId revocatedSplits revocationsReceived s = Some v -> 
+              v >= expectedAmount};
+      let valuesToMin = map (expectedSplitResolutionOption (p.recordOwner) (getTracedChannelId p) revocatedSplits revocationsReceived) signedSplits in
+      assert {forall v. member (Some v) valuesToMin -> v >= expectedAmount}; 
+      assert {p.bestSplitReceived.split.condOutput.amountCond = worstCaseChannelResolution sigs ch p lastWoken msgs};
+      assert {p.bestSplitReceived.split.condOutput.amountCond = channelExpectations gamma sigs p lastWoken msgs time}
+    end
+  end
+  
+  let lemma onQueueIncl (sigs1 sigs2 : signatureFunctionalityT) (t : timeT) (split : conditionalOutputT) (msgs newMsgs : list (msgToGammaT, timeT)) = 
+  requires {included sigs1 sigs2}
+  requires {existsL (fun m -> correctAndEarlyEnoughRevokeMsg sigs1 split t m) msgs}
+  ensures  {existsL (fun m -> correctAndEarlyEnoughRevokeMsg sigs2 split t m) (msgs ++ newMsgs)}
+  assert {forall m. correctAndEarlyEnoughRevokeMsg sigs1 split t m -> correctAndEarlyEnoughRevokeMsg sigs2 split t m};
+  assert {existsL (correctAndEarlyEnoughRevokeMsg sigs2 split t) msgs}
+  
+  
+  let lemma revocationsReceivedIncl (sigs1 sigs2 : signatureFunctionalityT) (p1 p2 : partySplitsAndRevocationsRecordStrictT) = 
+  requires {included sigs1 sigs2}
+  requires {goodSplitsAndRevocationsRecord p1 sigs1}
+  requires {goodSplitsAndRevocationsRecord p2 sigs2}
+  requires {includedList p1.receivedRevocations p2.receivedRevocations}
+  ensures  {includedList (extractRevocationsReceived p1.recordOwner sigs1 p1.receivedRevocations)
+                         (extractRevocationsReceived p2.recordOwner sigs2 p2.receivedRevocations)}
+  ()
+  
+  
+  
+  let lemma channelExpectationsNonDeceasingWhenDisputeOpen 
+                                                          (pOld : partySplitsAndRevocationsRecordStrictT)
+                                                          (systemView : partySystemView)
+                                                          (msgsOld : list (msgToGammaT, timeT))
+                                                          (pNew : partySplitsAndRevocationsRecordStrictT)
+                                                          (update : updateRecT) =
+  requires {(((computeVirtualContract pOld.getTracedChannelId systemView.gammaState pOld.recordOwner systemView.currentTime systemView.sigState) <&> contractStatus) <&> isDisputeOpen) = Some true}
+  requires {computeVirtualContract pOld.getTracedChannelId systemView.gammaState pOld.recordOwner systemView.currentTime systemView.sigState =
+            computeVirtualContract pNew.getTracedChannelId systemView.gammaState pNew.recordOwner systemView.currentTime update.newSigState}
+  requires {goodTransitionForChannel pOld.makeGeneral  systemView pNew.makeGeneral update}
+  requires {gammaCoherent systemView.gammaState}
+  requires { goodSplitsAndRevocationsRecord pOld systemView.sigState}
+  requires { goodSplitsAndRevocationsRecord pNew update.newSigState}
+  requires {included systemView.sigState update.newSigState}
+  requires {lastWokenInTime systemView.lastWoken systemView.currentTime}
+  requires {update.timeProcessedTo = systemView.currentTime}
+  ensures  { channelExpectations systemView.gammaState systemView.sigState pOld systemView.lastWoken   msgsOld                          systemView.currentTime <= 
+             channelExpectations systemView.gammaState update.newSigState  pNew systemView.currentTime (updateMsgs systemView.currentTime msgsOld update) systemView.currentTime}
+  let sigs1 = systemView.sigState in 
+  let sigs2 = update.newSigState in
+  let time = systemView.currentTime in
+  let p1 = pOld in
+  let p2 = pNew in
+  let msgs = msgsOld in
+  let newMsgs = updateMsgs time msgs update in
+  let gamma = systemView.gammaState in
+  let lastWoken = systemView.lastWoken in
+  let chopt1 = computeVirtualContract p1.getTracedChannelId gamma p1.recordOwner time sigs1 in 
+  let chopt2 = computeVirtualContract p2.getTracedChannelId gamma p2.recordOwner time sigs2 in 
+  assert {chopt1 = chopt2};
+  assert {p1.recordOwner = p2.recordOwner};
+  match chopt1 with 
+  | None -> absurd 
+  | Some ch -> 
+    assert {goodStatus ch.contractStatus};
+    match ch.contractStatus with 
+    | PublicKeyAccount _ _ _ -> absurd
+    | Normal _ -> absurd
+    | DisputeOpen split ->
+      (*Here we are left with showing the following statement*)
+      let st = worstCaseChannelResolution sigs1 ch p1 lastWoken msgs <= worstCaseChannelResolution sigs2 ch p2 time newMsgs in 
+      (*We start with some important facts*)
+      assert { goodSplitsAndRevocationsRecord p1 sigs1};
+      assert { goodSplitsAndRevocationsRecord p2 sigs2};
+      let signedSplits1 = extractSignedSplits (getSignedBy sigs1 p1.recordOwner) in 
+      let signedSplits2 = extractSignedSplits (getSignedBy sigs2 p2.recordOwner) in 
+      assert {includedList (getSignedBy sigs1 p2.recordOwner) (getSignedBy sigs2 p2.recordOwner) };
+      assert {includedList signedSplits1 signedSplits2};
+      let revsSigned1 = extractRevokedSplits (getSignedBy sigs1 p1.recordOwner) in
+      let revsSigned2 = extractRevokedSplits (getSignedBy sigs2 p2.recordOwner) in 
+      assert {includedList revsSigned1 revsSigned2};
+      let revsReceived1 = extractRevocationsReceived p1.recordOwner sigs1 p1.receivedRevocations in 
+      let revsReceived2 = extractRevocationsReceived p2.recordOwner sigs2 p2.receivedRevocations in 
+      assert { includedList revsReceived1 revsReceived2 }; 
+      (*^finisher*)
+      
+      (*We are now ready to start the proof of st. The proof goes by cases that match the if structure of worstCaseChannelResolution*)
+      (*First, we do the fist sanity check performed by the evaluator*)      
+      if not (existsL (compareCondOutputSplit split) signedSplits2) then(
+        assert {not (existsL (compareCondOutputSplit split) signedSplits1)}; 
+        assert {st}
+      )
+      else if not (existsL (compareCondOutputSplit split) signedSplits1) then 
+        assert{st}
+      else (
+      (*Now, we show that all the others sanity checks hold*)
+      assert {goodSplit p1.bestSplitReceived.split};
+      assert {goodSplit p2.bestSplitReceived.split};
+      assert {p1.bestSplitReceived.split.condOutput.id = split.id};
+      assert {p2.bestSplitReceived.split.condOutput.id = split.id};
+      assert {goodConditionalOutput split};
+      
+      (*At this point there are some cases to consider based on whether it is still early enough, and whether the revocation is already on the queue*)
+      let earlyEnough1 = lastWoken + deltaNet + deltaWake < ch.lastContractTransitionTime + channelTimelock in 
+      let earlyEnough2 = time + deltaNet + deltaWake < ch.lastContractTransitionTime + channelTimelock in 
+      assert { lastWoken <= time };
+      assert { earlyEnough2 -> earlyEnough1};
+      let onQueue1 = existsL (correctAndEarlyEnoughRevokeMsg sigs1 split (ch.lastContractTransitionTime + channelTimelock - deltaNet)) msgs in 
+      let onQueue2 = existsL (correctAndEarlyEnoughRevokeMsg sigs2 split (ch.lastContractTransitionTime + channelTimelock - deltaNet)) newMsgs in 
+      assert {onQueue1 -> onQueue2};
+      (*Now there are two hard cases:*)
+      if compareParties split.partyCond p1.recordOwner then (
+        (*The first hard case is when we are the party cond in the split*)
+        (*Here we need to show that we have not revoked that split*)
+        (*Since we already know (by the sanity check) that we have signed that split, it follows from goodSplitAndRevocationsRecord p2*)
+        assert {exists s. s.condOutput = split /\ member s signedSplits2}; 
+        assert {forall s. member s signedSplits2 -> exists sig. verify (p2.recordOwner) (SignableSplit s) sig sigs2};
+        assert {exists s sig. s.condOutput = split /\ verify p2.recordOwner (SignableSplit s) sig sigs2};
+        assert {exists s. s.condOutput = split /\ signedSplitsSpecExt p2.recordOwner p2.receivedRevocations s p2.bestSplitReceived.split.condOutput.amountCond sigs2};
+        assert {exists s. s.condOutput = split /\ forall sig. not verify p2.recordOwner (SignableRevoke s.condOutput) sig sigs2};
+        (*^unfold signedSplitsSpecExt in Assert*)
+        assert {forall sig. not verify p2.recordOwner (SignableRevoke split) sig sigs2};
+        assert {not (exists sig. verify p2.recordOwner (SignableRevoke split) sig sigs2)};
+        assert {forall s. member s revsSigned2 -> member (SignableRevoke s) (getSignedBy sigs2 p2.recordOwner)};
+        assert {forall s. member s revsSigned2 -> exists sig . verify p2.recordOwner (SignableRevoke s) sig sigs2};
+        assert {not (member split revsSigned2)};
+        assert {st}
+      ) else 
+      if earlyEnough1 && not earlyEnough2 && not onQueue2 then (
+          (*The other hard case is when it used to be early enough, but now it's not and we have not sent the message*)
+          (*We want to show that in this case we don't have the matching revocation, which is enough to finish the proof:*)
+          if num_occ_comp (compareConditionalOutputs) split revsReceived2 = 0 then assert {st} else (
+            (*The proof goes by contradiction*)
+            (*We say that if we had the matching revocation, then by revocationSendIfRequired we would have sent it*)
+            assert { systemView.lastWoken <> update.timeProcessedTo };
+            assert {revocationSendIfRequired (makeGeneral p2) systemView.lastWoken update gamma};
+            assert {isOurChannelInDisputeOpen gamma (p2.bestSplitReceived.split.condOutput.id) = Some (ch.lastContractTransitionTime, split)};
+            (*^unfold isOurChannelInDisputeOpen*)
+            assert { makeStrict (makeGeneral p2) = Some p2 };
+            assert {time < ((ch.lastContractTransitionTime + channelTimelock) - deltaNet)};
+            assert {(exists sig. num_occ (sig, split) (p2.receivedRevocations) > 0) ->
+                    (exists msg. applicableRevokeMsg sigs2 split msg /\ num_occ msg update.msgsToSend > 0)};
+            (*^unfold revocationSendIfRequired in Assert3*)
+            assert {member split (extractRevocationsReceived p2.recordOwner sigs2 p2.receivedRevocations)};
+            assert {exists sig. num_occ (sig, split) (p2.receivedRevocations) > 0};
+            assert {exists msg. applicableRevokeMsg sigs2 split msg /\ num_occ (msg, time) newMsgs > 0}; (*unfold newMsgs; unfold updateMsgs*)
+            assert {time < ((ch.lastContractTransitionTime + channelTimelock) - deltaNet)};
+            assert {exists msg. (correctAndEarlyEnoughRevokeMsg sigs2 split (ch.lastContractTransitionTime + channelTimelock - deltaNet) msg) /\ member msg newMsgs};
+            (*^unfold correctAndEarlyEnoughRevokeMsg*)
+            assert {forall msg . member msg newMsgs -> member msg newMsgs};
+            assert {exists msg. (correctAndEarlyEnoughRevokeMsg sigs2 split (ch.lastContractTransitionTime + channelTimelock - deltaNet) msg) /\ member msg newMsgs};
+            absurd
+          )
+      )
+      else assert {st} (*finisher*));
+      assert {st};
+      assert { worstCaseChannelResolution sigs1 ch p1 lastWoken msgs <= worstCaseChannelResolution sigs2 ch p2 time (newMsgs ++ msgs)};
+      assert { channelExpectations gamma sigs1 p1 lastWoken msgs time <= channelExpectations gamma sigs2 p2 time (newMsgs ++ msgs) time}
+    end
+  end
+  
+
+  let lemma channelMinusBalanceOurHelper (systemView : partySystemView) (pgOld pgNew : partySplitsAndRevocationsRecordGeneralT) (msgsOld : list (msgToGammaT, timeT)) (updateRec : updateRecT) = 
+  requires {gammaCoherent systemView.gammaState}
+  requires {goodSplitsAndRevocationsRecordOption pgOld.makeStrict systemView.sigState}
+  requires {goodSplitsAndRevocationsRecordOption pgNew.makeStrict updateRec.newSigState}
+  requires {included systemView.sigState updateRec.newSigState}
+  requires {lastWokenInTime systemView.lastWoken systemView.currentTime}
+  requires {updateRec.timeProcessedTo = systemView.currentTime}
+  requires {goodTransitionForChannel pgOld systemView pgNew updateRec}
+  ensures  { channelMinusBalanceOurA pgOld systemView.sigState systemView.gammaState systemView.lastWoken msgsOld systemView.currentTime <=
+             channelMinusBalanceOurA pgNew updateRec.newSigState systemView.gammaState systemView.currentTime (updateMsgs systemView.currentTime msgsOld updateRec) systemView.currentTime }
+  let pg1 = pgOld in
+  let pg2 = pgNew in
+  let currentTime = systemView.currentTime in
+  let lastWoken = systemView.lastWoken in
+  let gamma = systemView.gammaState in
+  let sigs1 = systemView.sigState in
+  let sigs2 = updateRec.newSigState in
+  let updatedMsgs = updateMsgs currentTime msgsOld updateRec in
+  let st = channelMinusBalanceOurA pgOld systemView.sigState systemView.gammaState lastWoken msgsOld currentTime <=
+           channelMinusBalanceOurA pgNew updateRec.newSigState systemView.gammaState currentTime (updateMsgs currentTime msgsOld updateRec) currentTime in
+  let _p = pg1.recordOwnerG in 
+  match (pg1.makeStrict, pg2.makeStrict) with 
+    | (Some _p1, None) -> absurd
+    | (None, None) ->
+        assert {channelMinusBalanceOurA pg1 sigs1 gamma lastWoken msgsOld currentTime = 0};
+        assert {channelMinusBalanceOurA pg2 sigs2 gamma currentTime updatedMsgs currentTime = 0};
+        assert {st};
+    | (None, Some p2) ->
+        assert {balanceOurAGeneric pg1 = 0};
+        assert {channelMinusBalanceOurA pg1 sigs1 gamma lastWoken msgsOld currentTime = 0};
+        assert {onlyLegalTransfers pg1 pg2 gamma sigs2};
+        assert {isRecordsVirtualChannelInNormal pgNew gamma sigs2};
+        match (computeVirtualContract (getTracedChannelId p2) gamma (p2.recordOwner) currentTime sigs2) <&> contractStatus with 
+        | None 
+        | Some (DisputeOpen _) 
+        | Some (PublicKeyAccount _ _ _) -> 
+          absurd (*unfold computeVirtualContract in H*)
+        | Some (Normal _s) ->
+          channelExpectationsEqualBalanceWhenNormal gamma p2 currentTime sigs2 lastWoken (updateMsgs currentTime msgsOld updateRec);
+          assert {st};
+        end;                                       
+        assert {st};
+    | (Some p1, Some p2) ->
+        assert {bestHsSplitTransition pg1.bestSplitReceivedG pg2.bestSplitReceivedG};
+        assert {p2.bestSplitReceived.split.condOutput.id = p2.bestSplitReceived.split.condOutput.id}; 
+        let chId = p1.bestSplitReceived.split.condOutput.id in 
+        let party = p1.recordOwner in 
+        assert {party = p2.recordOwner};
+        let och1 = computeVirtualContract chId gamma party currentTime sigs1 in 
+        let och2 = computeVirtualContract chId gamma party currentTime sigs2 in 
+        assert {och1 = computeVirtualContract p1.bestSplitReceived.split.condOutput.id gamma p1.recordOwner currentTime sigs1};
+        assert {och2 = computeVirtualContract p2.bestSplitReceived.split.condOutput.id gamma p2.recordOwner currentTime sigs2};
+        match (och1, och2) with 
+          | (None, None) ->
+            assert { onlyLegalTransfers pg1 pg2 gamma sigs2};
+            assert {pg1.bestSplitReceivedG = Some p1.bestSplitReceived};
+            assert {extractChannelByIdFromGamma gamma p1.bestSplitReceived.split.condOutput.id = None};
+            assert {pg2.balanceOurAGeneric = pg1.balanceOurAGeneric};
+            assert {p1.bestSplitReceived.split.condOutput.amountCond >= p2.bestSplitReceived.split.condOutput.amountCond};
+            assert {st}
+          | (Some _x, None) -> absurd 
+          | (None, Some _ch) -> assert {st}
+          | (Some ch1, Some ch2) ->
+              let _ = computeVirtualContractStatusPreserved chId gamma party currentTime sigs1 sigs2 ch1 ch2 in 
+              assert {ch1 = ch2};
+              match ch1.contractStatus with 
+                | Normal _args -> assert {st};
+                  (*Here we use channelExpectationsEqualBalanceWhenNormal, but this happens automatically *)
+                | DisputeOpen _split ->
+                  assert { not (isOurChannelInNormal gamma chId) };
+                  assert { not (isRecordsChannelInNormal gamma pg1)};
+                  assert { not (isRecordsVirtualChannelInNormal pg1 gamma sigs2)};
+                  (*^ unfold isRecordsVirtualChannelInNormal; unfold isOurChannelInNormal in Assert1; unfold computeVirtualContractStatus*)
+                  assert {pg2.balanceOurAGeneric = pg1.balanceOurAGeneric}; 
+                  let _newMsgs = map (fun x -> (x, currentTime)) updateRec.msgsToSend in 
+                  channelExpectationsNonDeceasingWhenDisputeOpen p1 systemView msgsOld p2 updateRec;
+                  assert {channelExpectationsG gamma sigs1 pg1 lastWoken msgsOld currentTime <= channelExpectationsG gamma sigs2 pg2 currentTime updatedMsgs currentTime};
+                  assert { st };
+                | PublicKeyAccount _ _ _ -> absurd
+              end
+        end;
+        assert {st}
+  end
+
+  let lemma totalEvaluatorMinusTotalBalanceMonotone (systemView : partySystemView) (pOld pNew : simplePartyT) (msgsOld : list (msgToGammaT, timeT)) (updateRec : updateRecT) =
+  requires {gammaCoherent systemView.gammaState}
+  requires {goodSplitsAndRevocationsRecordOption pOld.channelInfo.makeStrict systemView.sigState}
+  requires {goodSplitsAndRevocationsRecordOption pNew.channelInfo.makeStrict updateRec.newSigState}
+  requires {included systemView.sigState updateRec.newSigState}
+  requires {lastWokenInTime systemView.lastWoken systemView.currentTime}
+  requires {updateRec.timeProcessedTo = systemView.currentTime}
+  requires {goodTransition pOld systemView pNew updateRec} 
+  ensures  {totalEvaluatorMinusTotalBalance pOld systemView.sigState systemView.gammaState systemView.lastWoken msgsOld  <=
+            totalEvaluatorMinusTotalBalance pNew updateRec.newSigState systemView.gammaState systemView.currentTime (updateMsgs systemView.currentTime msgsOld updateRec)}
+  channelMinusBalanceOurHelper systemView pOld.channelInfo pNew.channelInfo msgsOld updateRec;
+  partyExpectationsEqualG systemView.gammaState systemView.sigState pOld.channelInfo systemView.lastWoken msgsOld systemView.currentTime;
+  partyExpectationsEqualG systemView.gammaState updateRec.newSigState pNew.channelInfo systemView.currentTime (updateMsgs systemView.currentTime msgsOld updateRec) systemView.currentTime;
+  assert { totalEvaluatorMinusTotalBalance pOld systemView.sigState systemView.gammaState systemView.lastWoken msgsOld = 
+           channelMinusBalanceOurA pOld.channelInfo systemView.sigState systemView.gammaState systemView.lastWoken msgsOld systemView.currentTime +
+           (immediatePartyExpectations systemView.gammaState pOld.channelInfo.recordOwnerG systemView.sigState - pOld.onChainBalance)};
+  assert { totalEvaluatorMinusTotalBalance pNew updateRec.newSigState systemView.gammaState systemView.currentTime (updateMsgs systemView.currentTime msgsOld updateRec) =
+           channelMinusBalanceOurA pNew.channelInfo updateRec.newSigState systemView.gammaState systemView.currentTime (updateMsgs systemView.currentTime msgsOld updateRec) systemView.currentTime +
+           (immediatePartyExpectations systemView.gammaState pNew.channelInfo.recordOwnerG updateRec.newSigState - pNew.onChainBalance)};
+  assert {updateRec.moneyMovedToChannel >= 0};
+  assert { immediatePartyExpectations systemView.gammaState pOld.channelInfo.recordOwnerG systemView.sigState - pOld.onChainBalance <= 
+           immediatePartyExpectations systemView.gammaState pNew.channelInfo.recordOwnerG updateRec.newSigState - pNew.onChainBalance}
+
+
+   
+end (* GammaEvaluatorConsistencyChannelProofs *)
+
+
+
+module GoodTransitionTransitiveProofs : GoodTransitionTransitiveLemmas
+(*This module follows the Statement-Proof separation convention. See the comment in honestPartyVsAdversary.mlw/ClosingWorksLemmas for more details.*)
+
+use int.Int
+use option.Option
+use list.List
+use list.NumOcc
+use list.Append
+use basicTypes.BasicTypes
+
+
+use signaturesFunctionality.SignaturesFunctionality
+use gamma.Gamma
+use listLibrary.ListLibrary
+  
+use GoodTransitionChannel
+use GoodSplitsAndRevocationsRecord
+use gamma.Evaluator
+use gamma.GammaBasicLemmas
+use gamma.EvaluatorBasicLemmas
+
+use SimplePartyTypes 
+use SimplePartyTypes
+use GoodTransitionClosing
+use GoodTransition
+
+let lemma combineUpdateRecsAssoc (u1 u2 u3 : updateRecT) =
+ensures {combineUpdateRecs u1 (combineUpdateRecs u2 u3) = combineUpdateRecs (combineUpdateRecs u1 u2) u3}
+()
+
+let lemma applyUpdateRecAssoc (s : partySystemView) (u1 u2 : updateRecT) = 
+ensures {applyUpdateRec (applyUpdateRec s u1) u2 = applyUpdateRec s (combineUpdateRecs u1 u2)}
+()
+
+let lemma goodTransitionTransitiveAux1 (pgOld pgMid pgNew : simplePartyT) (update1 update2 : updateRecT) (systemView : partySystemView) =
+requires {update1.timeProcessedTo <= update2.timeProcessedTo}
+requires {goodTransition pgOld systemView pgMid update1}
+requires {goodTransition pgMid (applyUpdateRec systemView update1) pgNew update2}
+ensures {bestHsSplitTransition (pgOld.channelInfo.bestSplitReceivedG) (pgNew.channelInfo.bestSplitReceivedG)}
+assert {bestHsSplitTransition  (pgOld.channelInfo.bestSplitReceivedG) (pgMid.channelInfo.bestSplitReceivedG)};
+assert {bestHsSplitTransition  (pgMid.channelInfo.bestSplitReceivedG) (pgNew.channelInfo.bestSplitReceivedG)};
+match (pgOld.channelInfo.bestSplitReceivedG, pgMid.channelInfo.bestSplitReceivedG, pgNew.channelInfo.bestSplitReceivedG) with
+  | None, _, _ -> assert {bestHsSplitTransition (pgOld.channelInfo.bestSplitReceivedG) (pgNew.channelInfo.bestSplitReceivedG)};
+  | Some _s1, None, _ -> absurd
+  | Some _s1, Some _s2, None -> absurd
+  | Some _s1, Some _s2, Some _s3 -> 
+    assert {bestHsSplitTransition (pgOld.channelInfo.bestSplitReceivedG) (pgNew.channelInfo.bestSplitReceivedG)}
+  end
+  
+let lemma goodTransitionTransitiveAux2 (pgOld pgMid pgNew : simplePartyT) (update1 update2 : updateRecT) (systemView : partySystemView) =
+requires {update1.timeProcessedTo <= update2.timeProcessedTo}
+requires {goodTransition pgOld systemView pgMid update1}
+requires {goodTransition pgMid (applyUpdateRec systemView update1) pgNew update2}
+ensures { revocationSendIfRequired pgNew.channelInfo systemView.lastWoken (combineUpdateRecs update1 update2) (systemView.gammaState)}
+assert {systemView.gammaState = (applyUpdateRec systemView update1).gammaState};
+assert {(combineUpdateRecs update1 update2).timeProcessedTo = update2.timeProcessedTo};
+assert {onlyLegalTransfers pgMid.channelInfo pgNew.channelInfo systemView.gammaState update2.newSigState };
+assert {bestHsSplitTransition pgMid.channelInfo.bestSplitReceivedG pgNew.channelInfo.bestSplitReceivedG };
+assert {revocationSendIfRequired pgNew.channelInfo update1.timeProcessedTo update2 (applyUpdateRec systemView update1).gammaState};
+assert {revocationSendIfRequired pgMid.channelInfo systemView.lastWoken update1 (systemView.gammaState)};
+let st = revocationSendIfRequired pgNew.channelInfo systemView.lastWoken (combineUpdateRecs update1 update2) (systemView.gammaState) in 
+if update2.timeProcessedTo <> update1.timeProcessedTo then (
+match pgNew.channelInfo.makeStrict with 
+| None -> assert {st};
+| Some pNew -> 
+  match isOurChannelInDisputeOpen (applyUpdateRec systemView update1).gammaState pNew.bestSplitReceived.split.condOutput.id with 
+  | None -> assert {st};
+  | Some (disputeOpenTime, msplitInResolution) -> 
+    assert {isOurChannelInDisputeOpen systemView.gammaState pNew.bestSplitReceived.split.condOutput.id = Some (disputeOpenTime, msplitInResolution)};
+    if (combineUpdateRecs update1 update2).timeProcessedTo >= disputeOpenTime + channelTimelock - deltaNet then assert {st}
+    else (
+    assert {update2.timeProcessedTo < disputeOpenTime + channelTimelock - deltaNet};
+    assert { forall msg. num_occ msg update2.msgsToSend > 0 -> num_occ msg (combineUpdateRecs update1 update2).msgsToSend > 0};
+    assert { (not (exists sig. num_occ (sig, msplitInResolution) pNew.receivedRevocations > 0)) -> st};
+    assert {(exists sig. num_occ (sig, msplitInResolution) pNew.receivedRevocations > 0) ->
+            (exists msg. applicableRevokeMsg update2.newSigState msplitInResolution msg /\ num_occ msg update2.msgsToSend > 0)}; (*unfold revocationSendIfRequired in Assert5*)
+    assert {(exists sig. num_occ (sig, msplitInResolution) pNew.receivedRevocations > 0) ->
+            (exists msg. applicableRevokeMsg (combineUpdateRecs update1 update2).newSigState msplitInResolution msg /\ num_occ msg (combineUpdateRecs update1 update2).msgsToSend > 0)};
+    assert { (exists sig. num_occ (sig, msplitInResolution) pNew.receivedRevocations > 0) -> st}; (*unfold revocationSentIfRequired*)
+    assert {st}
+    )
+  end
+end )
+else if update1.timeProcessedTo <> systemView.lastWoken then (
+  match pgMid.channelInfo.makeStrict, pgNew.channelInfo.makeStrict with
+  | _, None ->
+    assert {st};
+  | None, Some pNew ->
+    assert {isRecordsVirtualChannelInNormal pgNew.channelInfo systemView.gammaState update2.newSigState};
+    assert {isOurChannelInDisputeOpen systemView.gammaState pNew.bestSplitReceived.split.condOutput.id = None}; (*unfold isRecordsVirtualChannelInNormal in Assert; unfold isOurChannelInDisputeOpen; rewrite H1 in Assert*)
+    assert {st};
+  | Some pMid, Some pNew -> 
+    assert {pMid.bestSplitReceived.split.condOutput.id = pNew.bestSplitReceived.split.condOutput.id};
+    match isOurChannelInDisputeOpen systemView.gammaState pMid.bestSplitReceived.split.condOutput.id with
+    | None -> assert {st};
+    | Some (disputeOpenTime, msplitInResolution) -> 
+      assert {isOurChannelInDisputeOpen systemView.gammaState pMid.bestSplitReceived.split.condOutput.id = Some (disputeOpenTime, msplitInResolution)};
+      if (combineUpdateRecs update1 update2).timeProcessedTo >= disputeOpenTime + channelTimelock - deltaNet then assert {st}
+      else ( 
+      assert {isRecordsChannelInDisputeOpen systemView.gammaState pgMid.channelInfo};
+      assert {isRecordsChannelInDisputeOpen systemView.gammaState pgNew.channelInfo};
+      assert {noNewRevocationsWhenDisputeOpen systemView.gammaState pgMid.channelInfo pgNew.channelInfo};
+      assert {pMid.receivedRevocations = pNew.receivedRevocations};
+      assert {update2.timeProcessedTo < disputeOpenTime + channelTimelock - deltaNet};
+      assert {update1.timeProcessedTo < disputeOpenTime + channelTimelock - deltaNet};
+      assert { forall msg. num_occ msg update1.msgsToSend > 0 -> num_occ msg (combineUpdateRecs update1 update2).msgsToSend > 0};
+      assert { (not (exists sig. num_occ (sig, msplitInResolution) pMid.receivedRevocations > 0)) -> st};
+      assert { forall msg. applicableRevokeMsg update1.newSigState msplitInResolution msg -> applicableRevokeMsg update2.newSigState msplitInResolution msg}; (*unfold applicableRevokeMsg*)
+      assert {(exists sig. num_occ (sig, msplitInResolution) pMid.receivedRevocations > 0) ->
+              (exists msg. applicableRevokeMsg update1.newSigState msplitInResolution msg /\ num_occ msg update1.msgsToSend > 0)}; (*unfold revocationSentIfRequired in Assert5*)
+      assert {signatureFunctionalityTransition (other (simplePartySide pgMid)) (applyUpdateRec systemView update1).sigState (update2.newSigState)};
+      assert {signatureFunctionalityTransition (other (simplePartySide pgMid)) update1.newSigState update2.newSigState}; 
+      assert {(exists sig. num_occ (sig, msplitInResolution) pMid.receivedRevocations > 0) ->
+              (exists msg. applicableRevokeMsg (combineUpdateRecs update1 update2).newSigState msplitInResolution msg /\ num_occ msg (combineUpdateRecs update1 update2).msgsToSend > 0)};
+      assert {(exists sig. num_occ (sig, msplitInResolution) pMid.receivedRevocations > 0) -> st}; (*unfold revocationSentIfRequired*)
+      assert {st})
+    end
+  end
+)
+else assert {st}
+
+let lemma goodTransitionTransitiveAuxRevocationsOnlyChangeInNormal (pgOld pgMid pgNew : simplePartyT) (update1 update2 : updateRecT) (systemView : partySystemView) =
+requires {update1.timeProcessedTo <= update2.timeProcessedTo}
+requires {goodTransition pgOld systemView pgMid update1}
+requires {goodTransition pgMid (applyUpdateRec systemView update1) pgNew update2}
+ensures {noNewRevocationsWhenDisputeOpen systemView.gammaState pgOld.channelInfo pgNew.channelInfo}
+assert {noNewRevocationsWhenDisputeOpen systemView.gammaState pgOld.channelInfo pgMid.channelInfo};
+assert {noNewRevocationsWhenDisputeOpen systemView.gammaState pgMid.channelInfo pgNew.channelInfo};
+assert {bestHsSplitTransition pgOld.channelInfo.bestSplitReceivedG pgMid.channelInfo.bestSplitReceivedG};
+assert {bestHsSplitTransition pgMid.channelInfo.bestSplitReceivedG pgNew.channelInfo.bestSplitReceivedG};
+match (pgOld.channelInfo.makeStrict, pgMid.channelInfo.makeStrict, pgNew.channelInfo.makeStrict) with
+| None, None, None -> assert {noNewRevocationsWhenDisputeOpen systemView.gammaState pgOld.channelInfo pgNew.channelInfo};
+| None, None, Some p3 -> 
+  assert {isRecordsVirtualChannelInNormal pgNew.channelInfo systemView.gammaState update2.newSigState};
+  assert {p3.getTracedChannelId.destination = Channel}; (*unfold isRecordsVirtualChannelInNormal in Assert*)
+  assert {isOurChannelInDisputeOpen systemView.gammaState p3.bestSplitReceived.split.condOutput.id = None};
+  (*^unfold isOurChannelInDisputeOpen; unfold isRecordsVirtualChannelInNormal in Assert1; unfold computeVirtualContractStatus in Assert1*)
+  assert {noNewRevocationsWhenDisputeOpen systemView.gammaState pgOld.channelInfo pgNew.channelInfo}
+| None, Some p2, Some p3 -> 
+  assert {p2.bestSplitReceived.split.condOutput.id = p3.bestSplitReceived.split.condOutput.id};
+  assert {isRecordsVirtualChannelInNormal pgMid.channelInfo systemView.gammaState update1.newSigState};
+  assert {p2.getTracedChannelId.destination = Channel}; (*unfold isRecordsVirtualChannelInNormal in Assert*)
+  assert {included update1.newSigState update2.newSigState};
+  assert {isRecordsVirtualChannelInNormal pgMid.channelInfo systemView.gammaState update2.newSigState};
+  (*^unfold isRecordsVirtualChannelInNormal; unfold computeVirtualContractStatus; unfold isRecordsVirtualChannelInNormal in Assert2; rewrite H1; rewrite H1 in Assert2; unfold computeVirtualContractStatus in Assert2*)
+  assert {p2.recordOwner = p3.recordOwner};
+  assert {isRecordsVirtualChannelInNormal pgNew.channelInfo systemView.gammaState update2.newSigState};
+  assert {isOurChannelInDisputeOpen systemView.gammaState p2.bestSplitReceived.split.condOutput.id = None};
+  (*^unfold isOurChannelInDisputeOpen; unfold isRecordsVirtualChannelInNormal in Assert; unfold computeVirtualContractStatus in Assert *)
+  assert {noNewRevocationsWhenDisputeOpen systemView.gammaState pgOld.channelInfo pgNew.channelInfo};
+| Some p1, Some p2, Some p3 ->
+  assert {p1.bestSplitReceived.split.condOutput.id = p2.bestSplitReceived.split.condOutput.id};
+  assert {p2.bestSplitReceived.split.condOutput.id = p3.bestSplitReceived.split.condOutput.id};
+  if equal (isOurChannelInDisputeOpen systemView.gammaState p1.bestSplitReceived.split.condOutput.id) None then
+    assert {noNewRevocationsWhenDisputeOpen systemView.gammaState pgOld.channelInfo pgNew.channelInfo}
+  else (
+  assert {noNewRevocationsWhenDisputeOpen systemView.gammaState pgOld.channelInfo pgMid.channelInfo};
+  assert {p1.receivedRevocations = p2.receivedRevocations};
+  assert {p2.receivedRevocations = p3.receivedRevocations};
+  assert {noNewRevocationsWhenDisputeOpen systemView.gammaState pgOld.channelInfo pgNew.channelInfo};
+  )
+| _ -> absurd 
+end
+
+
+
+let lemma isRecordsVirtualContractStatusPreservedInclSig (gamma : gammaStateT) (pg : partySplitsAndRevocationsRecordGeneralT) (sigs1 sigs2 : signatureFunctionalityT) (time : timeT)  =
+requires {isRecordsVirtualChannelInNormal pg gamma sigs1}
+requires {included sigs1 sigs2}
+ensures  {isRecordsVirtualChannelInNormal pg gamma sigs2}
+let st = isRecordsVirtualChannelInNormal pg gamma sigs2 in 
+match makeStrict pg with 
+| None -> absurd 
+| Some p ->
+    assert {isRecordsVirtualChannelInNormal pg gamma sigs1};
+    if not (equal (getTracedChannelId p).destination Channel) then absurd (*unfold isRecordsVirtualChannelInNormal in Assert; rewrite H1 in Assert*) else
+    let _dest = p.getTracedChannelId.destination in 
+    assert {p.getTracedChannelId.destination = Channel};
+    match extractChannelByIdFromGamma gamma (getTracedChannelId p) with
+    | Some _ch -> assert {st};
+    | None -> 
+        assert {(not (goodFunding gamma p.getTracedChannelId)) -> (computeVirtualContract p.getTracedChannelId gamma p.recordOwner time sigs1 = None)};
+        assert {(not (goodFunding gamma p.getTracedChannelId)) -> not (isRecordsVirtualChannelInNormal pg gamma sigs1)};
+        assert {goodFunding gamma (getTracedChannelId p)};
+        assert {isFunder (getTracedChannelId p) (p.recordOwner)};
+        assert { isSigned (p.recordOwner) (SignableTX (getTracedChannelId p)) sigs1};
+        assert { isSigned (p.recordOwner) (SignableTX (getTracedChannelId p)) sigs2};
+        assert {st}
+    end
+end
+  
+let lemma computeVirtualContractTimeInvariant (gamma : gammaStateT) (pg : partySplitsAndRevocationsRecordGeneralT) (sigs : signatureFunctionalityT) (time1 : timeT) =
+requires {isRecordsVirtualChannelInNormal pg gamma sigs}
+ensures  {isRecordsVirtualChannelInNormal pg gamma sigs}
+let st = isRecordsVirtualChannelInNormal pg gamma sigs in 
+match makeStrict pg with 
+  | None -> absurd
+  | Some p ->
+     assert {isRecordsVirtualChannelInNormal pg gamma sigs};
+     if not (equal (getTracedChannelId p).destination Channel) then absurd (*unfold isRecordsVirtualChannelInNormal in Assert; rewrite H1 in Assert*) else
+     let _dest = p.getTracedChannelId.destination in 
+     assert {(getTracedChannelId p).destination = Channel};
+     match extractChannelByIdFromGamma gamma (getTracedChannelId p) with
+     | Some _ch -> assert {st};
+     | None -> 
+        assert {(not (goodFunding gamma p.getTracedChannelId)) -> (computeVirtualContract p.getTracedChannelId gamma p.recordOwner time1 sigs = None)};
+        assert {(not (goodFunding gamma p.getTracedChannelId)) -> not (isRecordsVirtualChannelInNormal pg gamma sigs)};
+        assert {goodFunding gamma (getTracedChannelId p)};
+        assert {isFunder (getTracedChannelId p) (p.recordOwner)};
+        assert {isSigned (p.recordOwner) (SignableTX (getTracedChannelId p)) sigs};
+        assert {st}
+     end
+end
+
+
+let lemma goodTransitionTransitiveAux3 (pgOld pgMid pgNew : simplePartyT) (update1 update2 : updateRecT) (systemView : partySystemView) =
+requires {update1.timeProcessedTo <= update2.timeProcessedTo}
+requires {goodTransition pgOld systemView pgMid update1}
+requires {goodTransition pgMid (applyUpdateRec systemView update1) pgNew update2}
+ensures{ onlyLegalTransfers pgOld.channelInfo pgNew.channelInfo (systemView.gammaState) (combineUpdateRecs update1 update2).newSigState}
+let st = onlyLegalTransfers pgOld.channelInfo pgNew.channelInfo (systemView.gammaState) (combineUpdateRecs update1 update2).newSigState in 
+assert {onlyLegalTransfers pgOld.channelInfo pgMid.channelInfo systemView.gammaState update1.newSigState};
+assert {onlyLegalTransfers pgMid.channelInfo pgNew.channelInfo (applyUpdateRec systemView update1).gammaState update2.newSigState};
+assert {(applyUpdateRec systemView update1).gammaState = systemView.gammaState};
+(*assert {forall t. isRecordsVirtualChannelInNormal pgMid systemView.gammaState t update2.newSigState -> 
+                  isRecordsVirtualChannelInNormal pgNew systemView.gammaState t (combineUpdateRecs update1 update2).newSigState};*)
+let gamma = systemView.gammaState in 
+match (pgOld.channelInfo.makeStrict, pgMid.channelInfo.makeStrict, pgNew.channelInfo.makeStrict) with
+  | None, Some p2, Some p3 -> 
+    assert {p2.bestSplitReceived.split.condOutput.id = p3.bestSplitReceived.split.condOutput.id}; (*unfold onlyLegalTransfers in Assert1*)
+    assert {isRecordsVirtualChannelInNormal pgMid.channelInfo gamma update1.newSigState}; (*unfold isRecordsVirtualChannelInNormal*)
+    assert {isRecordsVirtualChannelInNormal pgNew.channelInfo gamma update1.newSigState}; (*unfold onlyLegalTransfers in Assert3; finisher*)
+    assert {isRecordsVirtualChannelInNormal pgNew.channelInfo gamma update1.newSigState};
+    assert {included update1.newSigState update2.newSigState};
+    assert {isRecordsVirtualChannelInNormal pgNew.channelInfo gamma update2.newSigState};
+    
+    assert {st}  
+  | None, _, _ -> assert {st}
+  | Some _, None, _ -> absurd
+  | Some _, Some _, None -> absurd
+  | Some p1, Some p2, Some p3 -> 
+    if isRecordsChannelInNormal gamma pgOld.channelInfo then assert {st} else (
+      assert  {p1.balanceOurAStrict = p2.balanceOurAStrict};
+      if p2.balanceOurAStrict = p3.balanceOurAStrict then assert {st} else (
+        assert {isRecordsChannelInNormal gamma pgMid.channelInfo};
+        assert {isOurChannelInNormal gamma (p2.bestSplitReceived.split.condOutput.id)};
+        assert {p2.bestSplitReceived.split.condOutput.id = p1.bestSplitReceived.split.condOutput.id};
+        assert {isOurChannelInNormal gamma (p1.bestSplitReceived.split.condOutput.id)};
+        assert {isRecordsChannelInNormal gamma pgOld.channelInfo};
+        assert {st}
+      );
+      assert  {st}
+    )
+  end
+
+let lemma whenComingToChannelChannelOpenerSentOrChannelPresentOnGammaTransitive (pgOld pgMid pgNew : simplePartyT) (update1 update2 : updateRecT) (systemView : partySystemView) =
+requires {goodTransition pgOld systemView pgMid update1}
+requires {goodTransition pgMid (applyUpdateRec systemView update1) pgNew update2}
+ensures {whenComingToChannelChannelOpenerSentOrChannelPresentOnGamma pgOld  systemView pgNew (combineUpdateRecs update1 update2)}
+let st = whenComingToChannelChannelOpenerSentOrChannelPresentOnGamma pgOld systemView pgNew (combineUpdateRecs update1 update2) in
+assert {whenComingToChannelChannelOpenerSentOrChannelPresentOnGamma pgOld systemView pgMid update1};
+assert {whenComingToChannelChannelOpenerSentOrChannelPresentOnGamma pgMid (applyUpdateRec systemView update1) pgNew update2};
+assert {systemView.gammaState = (applyUpdateRec systemView update1).gammaState};
+match pgOld.channelInfo.makeStrict, pgMid.channelInfo.makeStrict, pgNew.channelInfo.makeStrict with 
+| None, None, None -> assert {st}
+| None, None, Some psNew ->
+  if isOurChannelInNormal systemView.gammaState psNew.getTracedChannelId then assert {st} else (
+    assert {exists msg. correctChannelOpening psNew.getTracedChannelId update2.newSigState systemView.gammaState msg /\ member msg update2.msgsToSend};
+    assert {exists msg. correctChannelOpening psNew.getTracedChannelId update2.newSigState systemView.gammaState msg /\ member msg (combineUpdateRecs update1 update2).msgsToSend};
+    assert {st}
+  )
+| None, Some psMid, Some psNew ->
+  if isOurChannelInNormal systemView.gammaState psNew.getTracedChannelId then assert {st} else (
+    assert {exists msg. correctChannelOpening psMid.getTracedChannelId update1.newSigState systemView.gammaState msg /\ member msg update1.msgsToSend};
+    let msg = any msgToGammaT ensures {correctChannelOpening psMid.getTracedChannelId update1.newSigState systemView.gammaState result /\ member result update1.msgsToSend} in
+    assert {member msg (combineUpdateRecs update1 update2).msgsToSend};
+    assert {correctChannelOpening psMid.getTracedChannelId (combineUpdateRecs update1 update2).newSigState systemView.gammaState msg};
+    assert {bestHsSplitTransition pgMid.channelInfo.bestSplitReceivedG pgNew.channelInfo.bestSplitReceivedG};
+    assert {pgMid.channelInfo.bestSplitReceivedG = Some psMid.bestSplitReceived};
+    assert {pgNew.channelInfo.bestSplitReceivedG = Some psNew.bestSplitReceived};
+    (*assert {psMid = psNew};*)
+    assert {psMid.getTracedChannelId = psNew.getTracedChannelId};
+    assert {st};
+  )
+| Some _psOld, Some _psMid, Some _psNew -> assert {st}
+| _ -> absurd 
+end
+
+let lemma whenClosingSendsOpenDisputeTransitive (pgOld pgMid pgNew : simplePartyT) (update1 update2 : updateRecT) (systemView : partySystemView) =
+requires {goodTransition pgOld systemView pgMid update1}
+requires {goodTransition pgMid (applyUpdateRec systemView update1) pgNew update2}
+ensures {whenClosingSendsOpenDispute pgOld pgNew systemView.gammaState systemView.lastWoken (combineUpdateRecs update1 update2)}
+let st = whenClosingSendsOpenDispute pgOld pgNew systemView.gammaState systemView.lastWoken (combineUpdateRecs update1 update2) in
+if not pgNew.closingChannel then assert {st} else
+if  systemView.lastWoken = update2.timeProcessedTo && pgOld.closingChannel then assert {st} else (
+  assert {pgNew.closingChannel};
+  assert {systemView.lastWoken <> update2.timeProcessedTo \/ not pgOld.closingChannel};
+  match pgOld.closingChannel, pgMid.closingChannel, pgNew.closingChannel with 
+  | False, False, True ->
+    assert {whenClosingSendsOpenDisputeInner pgNew systemView.gammaState update2};
+    match pgNew.channelInfo.makeStrict with
+    | None -> assert {st};
+    | Some p ->
+      let id = p.getTracedChannelId in 
+      match extractChannelByIdFromGamma systemView.gammaState id with
+      | None -> assert {st};
+      | Some ch -> 
+        match ch.contractStatus with 
+        | Normal args -> 
+          assert {exists msg. member msg update2.msgsToSend /\ correctDisputeOpen args update2.newSigState msg};
+          let msg = any msgToGammaT ensures {member result update2.msgsToSend /\ correctDisputeOpen args update2.newSigState result} in
+          assert {member msg (combineUpdateRecs update1 update2).msgsToSend};
+          assert {correctDisputeOpen args (combineUpdateRecs update1 update2).newSigState msg};
+          assert {whenClosingSendsOpenDisputeInner pgNew systemView.gammaState (combineUpdateRecs update1 update2)};
+          assert {st};
+        | _ -> assert {st}
+        end 
+      end
+    end
+  | False, True, True  ->
+    assert {whenClosingSendsOpenDisputeInner pgMid systemView.gammaState update1};
+    match pgMid.channelInfo.makeStrict, pgNew.channelInfo.makeStrict with
+    | None, None -> assert {st};
+    | Some _psMid, None -> absurd
+    | None, Some _psNew -> absurd 
+    | Some psMid, Some psNew ->
+      assert { bestHsSplitTransition (pgMid.channelInfo.bestSplitReceivedG) (pgNew.channelInfo.bestSplitReceivedG)};
+      assert {psMid.bestSplitReceived.split.condOutput.id = psNew.bestSplitReceived.split.condOutput.id};
+      let id = psMid.getTracedChannelId in
+      assert {id = psNew.getTracedChannelId};
+      match extractChannelByIdFromGamma systemView.gammaState id with
+      | None -> assert {st};
+      | Some ch -> 
+        match ch.contractStatus with
+        | Normal args ->
+          assert {exists msg. member msg update1.msgsToSend /\ correctDisputeOpen args update1.newSigState msg};
+          let msg = any msgToGammaT ensures {member result update1.msgsToSend /\ correctDisputeOpen args update1.newSigState result} in
+          assert {member msg (combineUpdateRecs update1 update2).msgsToSend};
+          assert {included update1.newSigState update2.newSigState};
+          assert {correctDisputeOpen args (combineUpdateRecs update1 update2).newSigState msg};
+          assert {exists msg. member msg (combineUpdateRecs update1 update2).msgsToSend /\ correctDisputeOpen args (combineUpdateRecs update1 update2).newSigState msg};
+          assert {whenClosingSendsOpenDisputeInner pgNew systemView.gammaState (combineUpdateRecs update1 update2)};
+          assert {st}
+        | _ -> assert {st}
+        end
+      end 
+    end 
+  | True, True, True ->
+    match systemView.lastWoken = update1.timeProcessedTo, update1.timeProcessedTo = update2.timeProcessedTo with
+    | _, False ->
+      assert {whenClosingSendsOpenDisputeInner pgNew systemView.gammaState update2};
+      match pgNew.channelInfo.makeStrict with
+      | None -> assert {st};
+      | Some p ->
+        let id = p.getTracedChannelId in 
+        match extractChannelByIdFromGamma systemView.gammaState id with
+        | None -> assert {st};
+        | Some ch -> 
+          match ch.contractStatus with 
+          | Normal args -> 
+            assert {exists msg. member msg update2.msgsToSend /\ correctDisputeOpen args update2.newSigState msg};
+            let msg = any msgToGammaT ensures {member result update2.msgsToSend /\ correctDisputeOpen args update2.newSigState result} in
+            assert {member msg (combineUpdateRecs update1 update2).msgsToSend};
+            assert {correctDisputeOpen args (combineUpdateRecs update1 update2).newSigState msg};
+            assert {whenClosingSendsOpenDisputeInner pgNew systemView.gammaState (combineUpdateRecs update1 update2)};
+            assert {st};
+          | _ -> assert {st}
+          end 
+        end
+      end
+    | False, True ->
+      assert {whenClosingSendsOpenDisputeInner pgMid systemView.gammaState update1};
+      match pgMid.channelInfo.makeStrict, pgNew.channelInfo.makeStrict with
+      | None, None -> assert {st};
+      | Some _psMid, None -> absurd
+      | None, Some _psNew -> absurd 
+      | Some psMid, Some psNew ->
+        assert { bestHsSplitTransition (pgMid.channelInfo.bestSplitReceivedG) (pgNew.channelInfo.bestSplitReceivedG)};
+        assert {psMid.bestSplitReceived.split.condOutput.id = psNew.bestSplitReceived.split.condOutput.id};
+        let id = psMid.getTracedChannelId in
+        assert {id = psNew.getTracedChannelId};
+        match extractChannelByIdFromGamma systemView.gammaState id with
+        | None -> assert {st};
+        | Some ch -> 
+          match ch.contractStatus with
+          | Normal args ->
+            assert {exists msg. member msg update1.msgsToSend /\ correctDisputeOpen args update1.newSigState msg};
+            let msg = any msgToGammaT ensures {member result update1.msgsToSend /\ correctDisputeOpen args update1.newSigState result} in
+            assert {member msg (combineUpdateRecs update1 update2).msgsToSend};
+            assert {included update1.newSigState update2.newSigState};
+            assert {correctDisputeOpen args (combineUpdateRecs update1 update2).newSigState msg};
+            assert {exists msg. member msg (combineUpdateRecs update1 update2).msgsToSend /\ correctDisputeOpen args (combineUpdateRecs update1 update2).newSigState msg};
+            assert {whenClosingSendsOpenDisputeInner pgNew systemView.gammaState (combineUpdateRecs update1 update2)};
+            assert {st}
+          | _ -> assert {st} (*unfold whenClosingSendsDisputeOpen*)
+          end
+        end 
+      end 
+    | True, True -> absurd 
+    end
+  | False, False, False -> absurd 
+  | _ -> absurd 
+  end 
+)
+
+let lemma whenDisputeOpenAfterTimeoutAndCorrectSideSendClaimTransitive (pgOld pgMid pgNew : simplePartyT) (update1 update2 : updateRecT) (systemView : partySystemView) =
+requires {goodTransition pgOld systemView pgMid update1}
+requires {goodTransition pgMid (applyUpdateRec systemView update1) pgNew update2}
+ensures {whenDisputeOpenAfterTimeoutAndCorrectSideSendClaim pgOld pgNew systemView.gammaState systemView.lastWoken (combineUpdateRecs update1 update2)}
+let st = whenDisputeOpenAfterTimeoutAndCorrectSideSendClaim pgOld pgNew systemView.gammaState systemView.lastWoken (combineUpdateRecs update1 update2) in
+match pgNew.channelInfo.makeStrict with
+| None -> assert {st}
+| Some psNew -> 
+  let id = psNew.getTracedChannelId in
+  match extractChannelByIdFromGamma systemView.gammaState id with
+  | None -> assert {st}
+  | Some ch ->
+    match ch.contractStatus with
+    | DisputeOpen split ->
+      if equal split.partyCond.other pgNew.simplePartySide then assert {st} else (
+      if update2.timeProcessedTo <= ch.lastContractTransitionTime + channelTimelock then assert {st} else (
+      match systemView.lastWoken = update1.timeProcessedTo, update1.timeProcessedTo = update2.timeProcessedTo with
+      | _, False -> 
+        if not (pgNew.closingChannel) then assert {st} else (
+        assert {whenDisputeOpenAfterTimeoutAndCorrectSideSendClaim pgOld pgNew systemView.gammaState update1.timeProcessedTo update2};
+        assert {whenDisputeOpenAfterTimeoutAndCorrectSideSendClaimInner pgNew systemView.gammaState update2};
+        assert {exists msg. member msg update2.msgsToSend /\ correctClaimAfterTimeout split update2.newSigState msg};
+        let msg = any msgToGammaT ensures {member result update2.msgsToSend /\ correctClaimAfterTimeout split update2.newSigState result} in
+        assert {member msg (combineUpdateRecs update1 update2).msgsToSend};
+        assert {correctClaimAfterTimeout split (combineUpdateRecs update1 update2).newSigState msg};
+        assert { whenDisputeOpenAfterTimeoutAndCorrectSideSendClaimInner pgNew systemView.gammaState (combineUpdateRecs update1 update2)};
+        assert {st};
+        )
+      | False, True ->
+        match pgMid.closingChannel, pgNew.closingChannel with
+        | _, False -> assert {st}
+        | True, True ->
+          assert { whenDisputeOpenAfterTimeoutAndCorrectSideSendClaimInner pgMid systemView.gammaState update1};
+          match pgMid.channelInfo.makeStrict with
+          | None -> absurd 
+          | Some psMid -> 
+            assert { bestHsSplitTransition (pgMid.channelInfo.bestSplitReceivedG) (pgNew.channelInfo.bestSplitReceivedG)}; 
+            assert {psMid.bestSplitReceived.split.condOutput.id = psNew.bestSplitReceived.split.condOutput.id};
+            let idMid = psMid.getTracedChannelId in
+            assert {idMid = id};
+            assert {extractChannelByIdFromGamma systemView.gammaState idMid = Some ch};
+            assert { not (split.partyCond.other = pgNew.simplePartySide) };
+            assert { not (update2.timeProcessedTo <= ch.lastContractTransitionTime + channelTimelock )};
+            assert { exists msg. member msg update1.msgsToSend /\ correctClaimAfterTimeout split update1.newSigState msg};
+            let msg = any msgToGammaT ensures {member result update1.msgsToSend /\ correctClaimAfterTimeout split update1.newSigState result} in
+            assert {member msg (combineUpdateRecs update1 update2).msgsToSend};
+            assert {included update1.newSigState update2.newSigState};
+            assert {correctClaimAfterTimeout split (combineUpdateRecs update1 update2).newSigState msg};
+            assert {whenDisputeOpenAfterTimeoutAndCorrectSideSendClaimInner pgNew systemView.gammaState (combineUpdateRecs update1 update2)};
+            assert {st};            
+          end 
+        | False, True ->
+          assert {whenDisputeOpenAfterTimeoutAndCorrectSideSendClaim pgOld pgNew systemView.gammaState update1.timeProcessedTo update2};
+          assert { whenDisputeOpenAfterTimeoutAndCorrectSideSendClaimInner pgNew systemView.gammaState update2};
+          assert { exists msg. member msg update2.msgsToSend /\ correctClaimAfterTimeout split update2.newSigState msg};
+          let msg = any msgToGammaT ensures {member result update2.msgsToSend /\ correctClaimAfterTimeout split update2.newSigState result} in
+          assert {member msg (combineUpdateRecs update1 update2).msgsToSend};
+          assert {correctClaimAfterTimeout split (combineUpdateRecs update1 update2).newSigState msg};
+          assert { whenDisputeOpenAfterTimeoutAndCorrectSideSendClaimInner pgNew systemView.gammaState (combineUpdateRecs update1 update2)};
+          assert {st};
+        end
+      | True, True ->
+        assert {systemView.lastWoken = update2.timeProcessedTo};
+        match pgOld.closingChannel, pgMid.closingChannel, pgNew.closingChannel with
+        | _, _, False -> assert {st}
+        | False, False, True ->
+          assert {whenDisputeOpenAfterTimeoutAndCorrectSideSendClaim pgOld pgNew systemView.gammaState update1.timeProcessedTo update2};
+          assert { whenDisputeOpenAfterTimeoutAndCorrectSideSendClaimInner pgNew systemView.gammaState update2};
+          assert { exists msg. member msg update2.msgsToSend /\ correctClaimAfterTimeout split update2.newSigState msg};
+          let msg = any msgToGammaT ensures {member result update2.msgsToSend /\ correctClaimAfterTimeout split update2.newSigState result} in
+          assert {member msg (combineUpdateRecs update1 update2).msgsToSend};
+          assert {correctClaimAfterTimeout split (combineUpdateRecs update1 update2).newSigState msg};
+          assert { whenDisputeOpenAfterTimeoutAndCorrectSideSendClaimInner pgNew systemView.gammaState (combineUpdateRecs update1 update2)};
+          assert {st};
+        | False, True, True ->
+          assert { whenDisputeOpenAfterTimeoutAndCorrectSideSendClaimInner pgMid systemView.gammaState update1};
+          match pgMid.channelInfo.makeStrict with
+          | None -> absurd 
+          | Some psMid -> 
+            assert { bestHsSplitTransition (pgMid.channelInfo.bestSplitReceivedG) (pgNew.channelInfo.bestSplitReceivedG)}; 
+            assert {psMid.bestSplitReceived.split.condOutput.id = psNew.bestSplitReceived.split.condOutput.id};
+            let idMid = psMid.getTracedChannelId in
+            assert {idMid = id};
+            assert {extractChannelByIdFromGamma systemView.gammaState idMid = Some ch};
+            assert { not (split.partyCond.other = pgNew.simplePartySide) };
+            assert { not (update2.timeProcessedTo <= ch.lastContractTransitionTime + channelTimelock )};
+            assert { exists msg. member msg update1.msgsToSend /\ correctClaimAfterTimeout split update1.newSigState msg};
+            let msg = any msgToGammaT ensures {member result update1.msgsToSend /\ correctClaimAfterTimeout split update1.newSigState result} in
+            assert {member msg (combineUpdateRecs update1 update2).msgsToSend};
+            assert {included update1.newSigState update2.newSigState};
+            assert {correctClaimAfterTimeout split (combineUpdateRecs update1 update2).newSigState msg};
+            assert {whenDisputeOpenAfterTimeoutAndCorrectSideSendClaimInner pgNew systemView.gammaState (combineUpdateRecs update1 update2)};
+            assert {st};            
+          end 
+        | True, True, True -> assert {st}
+        | _ -> absurd
+        end
+      end
+      ))
+    | _ -> assert {st} (* unfold whenDisputeOpenAfterTimeoutAndCorrectSideSendClaim *)
+    end
+  end
+end
+
+
+let lemma goodTransitionTransitive (pgOld pgMid pgNew : simplePartyT) (update1 update2 : updateRecT) (systemView : partySystemView) =
+requires {update1.timeProcessedTo <= update2.timeProcessedTo}
+requires {goodTransition pgOld systemView pgMid update1}
+requires {goodTransition pgMid (applyUpdateRec systemView update1) pgNew update2}
+ensures {goodTransition pgOld systemView pgNew (combineUpdateRecs update1 update2)}
+assert { bestHsSplitTransition (pgOld.channelInfo.bestSplitReceivedG) (pgNew.channelInfo.bestSplitReceivedG)};
+(*let lemma goodTransitionTransitiveAux1 (pgOld pgMid pgNew : simplePartyT) (update1 update2 : updateRecT) (systemView : partySystemView)*)
+goodTransitionTransitiveAux2 pgOld pgMid pgNew update1 update2 systemView;
+assert { revocationSendIfRequired pgNew.channelInfo systemView.lastWoken (combineUpdateRecs update1 update2) (systemView.gammaState)};
+assert { onlyLegalTransfers pgOld.channelInfo pgNew.channelInfo (systemView.gammaState) (combineUpdateRecs update1 update2).newSigState };
+assert { preserved (other (simplePartySide pgOld)) (systemView.sigState) (update1.newSigState) };
+assert { preserved (other (simplePartySide pgOld)) (update1.newSigState) (update2.newSigState) };
+assert { preserved (other (simplePartySide pgOld)) (systemView.sigState) ((combineUpdateRecs update1 update2).newSigState) }
+
+end (*GoodTransitionTransitiveProof*)

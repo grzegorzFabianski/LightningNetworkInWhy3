@@ -1,0 +1,5 @@
+module basicTypes.BasicTypes
+  syntax val  deltaNet   "(Z.of_string \"10\")"
+  syntax val  deltaWake   "(Z.of_string \"5\")"
+  syntax val  channelTimelock   "(Z.of_string \"16\")"
+end

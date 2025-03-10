@@ -1,0 +1,140 @@
+(* This module define signature functionality,
+   inspired by functionality used in UC 
+   
+   Such signature functionality allows to execute sign and verify functions.
+   I keeps the list of already signed triples (signer, message, signature).
+   
+   Our signature functionality is very weak - it could answer that a given signature is not correct, and after it is signed change verify answer.
+   
+   *)
+
+module SignaturesFunctionalityAbstract 
+  use basicTypes.Prelude
+  use listLibrary.ListLibrary
+  
+  (* INPUT PARAMS *)
+  
+  type whoSignT
+  type whatsSignedT
+
+  (*instantiated whenever we clone this module *)
+  val function compareWhoSign (x y : whoSignT) : bool
+  ensures { result <-> x = y }
+  
+  val compareWhatsSigned (x y : whatsSignedT) : bool
+  ensures { result <-> x = y }
+  
+  (* END OF INPUT PARAMS *)
+  
+  (*
+  type of functionality
+  *)
+  type signatureFunctionalityT = {
+    storage : list (whoSignT, whatsSignedT, signatureT); (*already signed triples *)
+    counterSig : signatureT (*counter used to generate new fresh signatures *)
+  } invariant {
+    forall x y sig. num_occ (x, y, sig) storage > 0 -> sig < counterSig
+  } by {
+    storage = Nil; counterSig = 0
+  }
+  
+  (* Signatures of p in s2 = signatures of p in s1 + signatures on msgList *)
+  predicate enlarged (s1 : signatureFunctionalityT) (msgList : list (whatsSignedT, signatureT)) (p : whoSignT) (s2 : signatureFunctionalityT) =
+    forall msg sig. num_occ (p, msg, sig) s2.storage = num_occ (p, msg, sig) s1.storage + num_occ (msg, sig) msgList
+  
+  predicate included (s1 s2 : signatureFunctionalityT) =
+    forall q msg sig. num_occ (q, msg, sig) s1.storage <= num_occ (q, msg, sig) s2.storage
+  
+  (* Signatures of p in s2 = signatures of p in s1 *)
+  predicate preserved (p : whoSignT) (s1 s2 : signatureFunctionalityT) = 
+    forall msg. (exists sig. num_occ (p, msg, sig) s1.storage > 0) <-> (exists sig. num_occ (p, msg, sig) s2.storage > 0)
+  
+  predicate includedFor (p : whoSignT) (s1 s2 : signatureFunctionalityT) = 
+    forall msg sig. num_occ (p, msg, sig) s1.storage <= num_occ (p, msg, sig) s2.storage
+  
+  (* Specification of allowed changes of the signatures functionality from the perspective of the party `p`. *)
+  predicate signatureFunctionalityTransition (p : whoSignT) (s1 s2 : signatureFunctionalityT) =
+    preserved p s1 s2 /\ (*for party p*)
+    included s1 s2
+  
+  (*lemma preservedTrans : forall s1 s2 s3 p. preserved p s1 s2 -> preserved p s2 s3 -> preserved p s1 s3 *)
+  
+  let function sign2 (signer : whoSignT) (msgToSign : whatsSignedT) (s : signatureFunctionalityT) : (signatureT, signatureFunctionalityT) =
+  ensures {let (sig, s2) = result in enlarged s (Cons (msgToSign, sig) Nil) signer s2 /\ forall otherSigner. (not otherSigner = signer) -> signatureFunctionalityTransition otherSigner s s2}
+    s.counterSig, {
+     storage = Cons (signer, msgToSign, s.counterSig) s.storage;
+     counterSig = s.counterSig+1 }
+  
+  let function emptySignatureState : signatureFunctionalityT = 
+  {storage = Nil; counterSig = 0}
+  
+  (*lemma emptySigEmpty : forall x. num_occ x emptySignatureState.storage = 0*)
+  
+  let predicate comparePartySignableSig (x y: (whoSignT, whatsSignedT, signatureT)) =
+    ensures { result <-> x = y }
+    compareWhoSign (fst3 x) (fst3 y) && compareWhatsSigned (snd3 x) (snd3 y) && ((trd3 x) = (trd3 y))
+  
+  
+  predicate verify (signer : whoSignT) (msgToVerify : whatsSignedT) (sig : signatureT) (s : signatureFunctionalityT) =
+    num_occ (signer, msgToVerify, sig) s.storage > 0
+  
+  let predicate verify_comp (signer : whoSignT) (msgToVerify : whatsSignedT) (sig : signatureT) (s : signatureFunctionalityT) =
+  ensures { result <-> verify signer msgToVerify sig s }
+    num_occ_comp comparePartySignableSig (signer, msgToVerify, sig) s.storage > 0
+  
+  predicate notSigned (signer : whoSignT) (msgToVerify : whatsSignedT) (s : signatureFunctionalityT) = forall sig. not verify signer msgToVerify sig s
+  
+  let function getSignedBy (s : signatureFunctionalityT) (p : whoSignT) : (list whatsSignedT) =
+  ensures { forall m. num_occ m result > 0 <-> exists sig. verify p m sig s }
+    let res = map snd3 (filter (fun t -> compareWhoSign (fst3 t) p) s.storage) in
+    assert { forall sig m. verify p m sig s ->
+      num_occ (p, m, sig) (filter (fun t -> (fst3 t) = p) s.storage) > 0};
+    let lemma helper (m : whatsSignedT) =
+    requires { num_occ m res > 0 }
+    ensures { exists sig. verify p m sig s }
+      let x = any (whoSignT, whatsSignedT, signatureT)
+        ensures { snd3 result = m /\ num_occ result (filter (fun t -> compareWhoSign (fst3 t) p) s.storage) > 0 } in
+      assert { fst3 x = p };
+      assert { verify p m (trd3 x) s }; 
+    in
+    res
+  
+  predicate isSigned (signer : whoSignT) (msgToVerify : whatsSignedT) (s : signatureFunctionalityT) = 
+    let allSigned = getSignedBy s signer in 
+    num_occ msgToVerify allSigned > 0
+  
+  let predicate isSigned_comp (signer : whoSignT) (msgToVerify : whatsSignedT) (s : signatureFunctionalityT) = 
+  ensures { result <-> isSigned signer msgToVerify s }
+    let allSigned = getSignedBy s signer in 
+    num_occ_comp compareWhatsSigned msgToVerify allSigned > 0
+  
+end (* SignaturesFunctionalityAbstract *)
+
+
+
+module SignaturesFunctionality
+  use basicTypes.BasicTypes
+  
+  use basicTypes.Compare
+  
+  clone export SignaturesFunctionalityAbstract
+  with type whoSignT = partyT,
+       type whatsSignedT = signableT,
+       val compareWhoSign = compareParties,
+       val compareWhatsSigned = compareSignables
+  
+  let function sign (signer : partyT) (msgToSign : signableT) (s : signatureFunctionalityT) : (signatureT, signatureFunctionalityT) =
+  ensures {let (sig, s2) = result in enlarged s (Cons (msgToSign, sig) Nil) signer s2 /\ signatureFunctionalityTransition (other signer) s s2}
+    sign2 signer msgToSign s : (signatureT, signatureFunctionalityT)
+  
+  let function signSpec (signer : partyT) (msgToSign : signableT) (s : signatureFunctionalityT) (m : signableT) (sig : signatureT)  : unit =
+  requires { 
+    let (_, s2) = sign signer msgToSign s in
+    verify signer m sig s2 }
+  ensures { m = msgToSign \/ verify signer m sig s }
+    let (newSig, _) = sign signer msgToSign s in
+    assert { num_occ (signer, m, sig) s.storage + num_occ (m, sig) (Cons (msgToSign, newSig) Nil) > 0};
+    assert { num_occ (signer, m, sig) s.storage > 0 \/ num_occ (m, sig) (Cons (msgToSign, newSig) Nil) > 0 };
+    ()
+  
+end (*SignaturesFunctionality*)
